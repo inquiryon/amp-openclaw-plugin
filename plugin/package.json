@@ -1,0 +1,19 @@
+{
+  "name": "@inquiryon/openclaw-amp-governance",
+  "version": "1.1.1",
+  "description": "AMP governance plugin for OpenClaw",
+  "type": "module",
+  "files": [
+    "index.js",
+    "openclaw.plugin.json",
+    "hook/handler.ts",
+    "hook/HOOK.md",
+    "hook/amp_config.json"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "openclaw": {
+    "extensions": ["./index.js"]
+  }
+}

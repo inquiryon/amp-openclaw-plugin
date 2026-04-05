@@ -1,0 +1,9 @@
+{
+  "id": "amp-governance",
+  "name": "AMP Governance",
+  "description": "AMP transparency, accountability, and HITL integration for OpenClaw",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false
+  }
+}
