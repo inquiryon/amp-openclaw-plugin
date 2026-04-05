@@ -189,6 +189,7 @@ async function requestHitlEval(instanceId, tool, params) {
       tool,
       action:     params?.action || '*',
       context:    params || {},
+      prompt:     `${tool} | ${formatInput(tool, params)}`,
       hitl: {
         enable: true,
         when:   'policy',
