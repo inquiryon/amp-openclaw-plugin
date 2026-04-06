@@ -3,5 +3,6 @@
   "AMP_API_KEY": "amp_k_...",
   "AMP_ORG_ID": "O-...",
   "AGENT_NAME": "open-claw-1234",
-  "AMP_USERNAME": "you@example.com"
+  "AMP_USERNAME": "you@example.com",
+  "HITL_TIMEOUT_MINUTES": 10
 }

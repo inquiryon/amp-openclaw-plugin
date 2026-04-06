@@ -8,9 +8,7 @@ const CONFIG_FILE = `${process.env.HOME}/.openclaw/hooks/amp/amp_config.json`;
 // Tools that are internal/noisy — skip logging and policy checks
 const SKIP_TOOLS = new Set(['session_status', 'heartbeat']);
 
-// HITL polling config
-const HITL_POLL_INTERVAL_MS = 3000;       // 3 seconds between polls
-const HITL_TIMEOUT_MS      = 10 * 60 * 1000; // 10 minute max wait for human
+const HITL_POLL_INTERVAL_MS = 3000; // 3 seconds between polls
 
 let config = null;
 try {
@@ -19,6 +17,9 @@ try {
 } catch (err) {
   console.error('[AMP Governance] Failed to load config:', err.message);
 }
+
+// HITL timeout — configurable via HITL_TIMEOUT_MINUTES in amp_config.json (default: 10)
+const HITL_TIMEOUT_MS = (config?.HITL_TIMEOUT_MINUTES ?? 10) * 60 * 1000;
 
 // Module-level instance cache so we only init once per process lifetime
 let _instanceId = null;
