@@ -74,7 +74,8 @@ It looks like this:
   "AMP_API_KEY": "amp_k_...",
   "AMP_ORG_ID": "O-...",
   "AGENT_NAME": "open-claw-1234",
-  "AMP_USERNAME": "you@example.com"
+  "AMP_USERNAME": "you@example.com",
+  "HITL_TIMEOUT_MINUTES": 10
 }
 ```
 
@@ -87,6 +88,7 @@ Fill in the values you collected in Step 1:
 | `AMP_ORG_ID` | Your organization ID from AMP |
 | `AGENT_NAME` | The agent name you chose in Step 1, e.g. `open-claw-1234` |
 | `AMP_USERNAME` | Your AMP login email |
+| `HITL_TIMEOUT_MINUTES` | How long (in minutes) the agent waits for a human decision before blocking the tool call. Default is `10`. Increase this if your reviewers need more time to respond. |
 
 Save the file. Do not change `AMP_BACKEND_URL` unless your administrator has given you a different URL.
 
@@ -138,7 +140,7 @@ Policy decision: web_search | status=no-hitl
 Tool result: web_search | Status: OK | ...
 ```
 
-If a tool call requires human approval, you will receive a WhatsApp message from the agent notifying you that approval is being sought. The agent waits (up to 10 minutes) for the reviewer's decision before proceeding.
+If a tool call requires human approval, you will receive a WhatsApp message from the agent notifying you that approval is being sought. The agent waits for the reviewer's decision before proceeding (configurable via `HITL_TIMEOUT_MINUTES`, default 10 minutes).
 
 ### Sample AMP Governance of OpenClaw with WhatsApp
 Below is a sample output of Human-in-the-Loop (HITL) on WhatsApp when the human approved:
@@ -161,7 +163,7 @@ The plugin reads config from `~/.openclaw/hooks/amp/amp_config.json`. If the fil
 Check that `~/.openclaw/extensions/amp-governance/hook/` exists. If not, reinstall the plugin. You can also copy the files manually from the `hook/` directory in the [plugin repository](https://github.com/inquiryon/openclaw-amp-governance).
 
 **HITL approval times out**
-By default the agent waits up to 10 minutes for a human decision. If no one approves in time, the tool call is blocked. Check that you have AMP notifications enabled so you see approval requests promptly.
+By default the agent waits up to 10 minutes for a human decision. If no one approves in time, the tool call is blocked. To extend the window, set `HITL_TIMEOUT_MINUTES` in `amp_config.json` (e.g. `30` for 30 minutes) and restart OpenClaw. Make sure you have AMP notifications enabled so you see approval requests promptly.
 
 **Tool calls not appearing in AMP logs**
 Check that `AMP_BACKEND_URL` in your config points to the correct AMP server and that the server is reachable from the machine running OpenClaw.
