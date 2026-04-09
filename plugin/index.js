@@ -18,6 +18,31 @@ try {
   console.error('[AMP Governance] Failed to load config:', err.message);
 }
 
+function normalizeBackendUrl(raw) {
+  let base = String(raw || '').trim();
+  if (!base) return '';
+  // If scheme is missing, default to HTTPS for server deployments.
+  if (!/^https?:\/\//i.test(base)) base = `https://${base}`;
+  return base.replace(/\/+$/, '');
+}
+
+function buildAmpUrl(path) {
+  const base = normalizeBackendUrl(config?.AMP_BACKEND_URL);
+  if (!base) throw new Error('AMP_BACKEND_URL missing');
+  const suffix = String(path || '').startsWith('/') ? path : `/${path}`;
+  return `${base}${suffix}`;
+}
+
+function getAmpApiKey() {
+  let key = String(config?.AMP_API_KEY || '').trim();
+  // tolerate accidental wrapping or "Bearer ..." pastes
+  if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
+    key = key.slice(1, -1).trim();
+  }
+  if (/^bearer\s+/i.test(key)) key = key.replace(/^bearer\s+/i, '').trim();
+  return key;
+}
+
 // HITL timeout — configurable via HITL_TIMEOUT_MINUTES in amp_config.json (default: 10)
 const HITL_TIMEOUT_MS = (config?.HITL_TIMEOUT_MINUTES ?? 10) * 60 * 1000;
 
@@ -100,9 +125,11 @@ async function ensureInstance() {
   }
 
   try {
-    const res = await fetch(`${config.AMP_BACKEND_URL}/api/agent/init`, {
+    const initUrl = buildAmpUrl('/api/agent/init');
+    const apiKey = getAmpApiKey();
+    const res = await fetch(initUrl, {
       method: 'POST',
-      headers: { 'X-API-Key': config.AMP_API_KEY, 'Content-Type': 'application/json' },
+      headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         agent_name: config.AGENT_NAME,
         org_id:     config.AMP_ORG_ID,
@@ -114,7 +141,8 @@ async function ensureInstance() {
       }),
     });
     if (!res.ok) {
-      console.error(`[AMP Governance] /api/agent/init returned ${res.status}`);
+      const bodyText = await res.text().catch(() => '');
+      console.error(`[AMP Governance] /api/agent/init returned ${res.status}${bodyText ? ` | body=${bodyText}` : ''}`);
       return null;
     }
     const data = await res.json();
@@ -126,7 +154,11 @@ async function ensureInstance() {
     }
     return _instanceId || null;
   } catch (err) {
-    console.error('[AMP Governance] ensureInstance failed:', err.message);
+    const em = err && err.message ? err.message : String(err);
+    const ec = err && err.cause ? (err.cause.code || err.cause.message || String(err.cause)) : '';
+    let target = '';
+    try { target = buildAmpUrl('/api/agent/init'); } catch (_) {}
+    console.error(`[AMP Governance] ensureInstance failed: ${em}${ec ? ` | cause=${ec}` : ''}${target ? ` | url=${target}` : ''}`);
     return null;
   }
 }
@@ -136,9 +168,10 @@ async function ensureInstance() {
 async function ampLog(instanceId, message, level = 'INFO') {
   if (!config) return;
   try {
-    await fetch(`${config.AMP_BACKEND_URL}/api/log`, {
+    const apiKey = getAmpApiKey();
+    await fetch(buildAmpUrl('/api/log'), {
       method: 'POST',
-      headers: { 'X-API-Key': config.AMP_API_KEY, 'Content-Type': 'application/json' },
+      headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         instance_id: instanceId,
         service:     config.AGENT_NAME,
@@ -179,9 +212,10 @@ async function notifyUser(sender, message) {
  * The AMP backend eval engine decides allow vs HITL.
  */
 async function requestHitlEval(instanceId, tool, params) {
-  const res = await fetch(`${config.AMP_BACKEND_URL}/api/hitl/request`, {
+  const apiKey = getAmpApiKey();
+  const res = await fetch(buildAmpUrl('/api/hitl/request'), {
     method: 'POST',
-    headers: { 'X-API-Key': config.AMP_API_KEY, 'Content-Type': 'application/json' },
+    headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       caller_id:  instanceId,
       instance_id: instanceId,
@@ -205,12 +239,13 @@ async function requestHitlEval(instanceId, tool, params) {
  * Poll /api/hitl/get-decision until we get a 'complete' status or time out.
  */
 async function pollHitlDecision(callerId) {
+  const apiKey = getAmpApiKey();
   const deadline = Date.now() + HITL_TIMEOUT_MS;
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, HITL_POLL_INTERVAL_MS));
     const res = await fetch(
-      `${config.AMP_BACKEND_URL}/api/hitl/get-decision?caller_id=${encodeURIComponent(callerId)}`,
-      { headers: { 'X-API-Key': config.AMP_API_KEY } }
+      `${buildAmpUrl('/api/hitl/get-decision')}?caller_id=${encodeURIComponent(callerId)}`,
+      { headers: { 'X-API-Key': apiKey } }
     );
     if (!res.ok) {
       console.warn(`[AMP Governance] get-decision returned ${res.status}, retrying...`);

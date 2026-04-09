@@ -6,6 +6,29 @@ console.log('--- [AMP Hook] Logic Loaded — Phase 5 ---');
 const configPath = path.join(process.env.HOME || '', '.openclaw/hooks/amp/amp_config.json');
 const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
 
+function normalizeBackendUrl(raw: unknown): string {
+  let base = String(raw || '').trim();
+  if (!base) return '';
+  if (!/^https?:\/\//i.test(base)) base = `https://${base}`;
+  return base.replace(/\/+$/, '');
+}
+
+function buildAmpUrl(p: string): string {
+  const base = normalizeBackendUrl((config as any).AMP_BACKEND_URL);
+  if (!base) throw new Error('AMP_BACKEND_URL missing');
+  const suffix = p.startsWith('/') ? p : `/${p}`;
+  return `${base}${suffix}`;
+}
+
+function getAmpApiKey(): string {
+  let key = String((config as any).AMP_API_KEY || '').trim();
+  if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
+    key = key.slice(1, -1).trim();
+  }
+  if (/^bearer\s+/i.test(key)) key = key.replace(/^bearer\s+/i, '').trim();
+  return key;
+}
+
 const SESSION_FILE = '/tmp/amp-session-state.json';
 const COMMAND_THRESHOLD = 30;  // roll to new instance after this many tool calls
 
@@ -20,9 +43,10 @@ let _startupCleanupDone = false;
 
 async function ampLog(instanceId: string, message: string, level: string = 'INFO'): Promise<void> {
   try {
-    await fetch(`${config.AMP_BACKEND_URL}/api/log`, {
+    const apiKey = getAmpApiKey();
+    await fetch(buildAmpUrl('/api/log'), {
       method: 'POST',
-      headers: { 'X-API-Key': config.AMP_API_KEY, 'Content-Type': 'application/json' },
+      headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         instance_id: instanceId,
         service:     config.AGENT_NAME,
@@ -40,9 +64,10 @@ async function ampLog(instanceId: string, message: string, level: string = 'INFO
 
 async function setInstanceFinished(instanceId: string): Promise<void> {
   try {
-    await fetch(`${config.AMP_BACKEND_URL}/api/agent/setState`, {
+    const apiKey = getAmpApiKey();
+    await fetch(buildAmpUrl('/api/agent/setState'), {
       method: 'POST',
-      headers: { 'X-API-Key': config.AMP_API_KEY, 'Content-Type': 'application/json' },
+      headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({ agent_name: config.AGENT_NAME, instance_id: instanceId, state: 'finished' })
     });
     console.log(`[AMP Hook] Instance ${instanceId} marked finished.`);
@@ -123,9 +148,11 @@ async function finalizeInstance(convKey: string, reason: string): Promise<void> 
 
 async function initInstance(convKey: string, prompt: string, metadata: object): Promise<string | null> {
   try {
-    const response = await fetch(`${config.AMP_BACKEND_URL}/api/agent/init`, {
+    const initUrl = buildAmpUrl('/api/agent/init');
+    const apiKey = getAmpApiKey();
+    const response = await fetch(initUrl, {
       method: 'POST',
-      headers: { 'X-API-Key': config.AMP_API_KEY, 'Content-Type': 'application/json' },
+      headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         agent_name: config.AGENT_NAME,
         prompt,
@@ -134,16 +161,21 @@ async function initInstance(convKey: string, prompt: string, metadata: object): 
         metadata:   { source: 'openclaw-whatsapp', org_id: config.AMP_ORG_ID, ...metadata }
       })
     });
-    const data = await response.json();
-    console.log(`[AMP Hook] Init response: ${response.status} | instance: ${data.instance_id || 'NONE'}`);
+    const data = await response.json().catch(() => ({} as any));
+    const errText = (data && (data.error || data.detail || data.message)) ? String(data.error || data.detail || data.message) : '';
+    console.log(`[AMP Hook] Init response: ${response.status} | instance: ${data.instance_id || 'NONE'}${errText ? ` | error: ${errText}` : ''}`);
     if (data.instance_id) {
       sessionMap.set(convKey, data.instance_id);
       commandCounts.set(convKey, 0);
       writeSessionFile(data.instance_id, convKey);
       return data.instance_id;
     }
-  } catch (err) {
-    console.error('[AMP Hook] initInstance failed:', err);
+  } catch (err: any) {
+    const em = err?.message || String(err);
+    const ec = err?.cause ? (err.cause.code || err.cause.message || String(err.cause)) : '';
+    let target = '';
+    try { target = buildAmpUrl('/api/agent/init'); } catch {}
+    console.error(`[AMP Hook] initInstance failed: ${em}${ec ? ` | cause=${ec}` : ''}${target ? ` | url=${target}` : ''}`);
   }
   return null;
 }
