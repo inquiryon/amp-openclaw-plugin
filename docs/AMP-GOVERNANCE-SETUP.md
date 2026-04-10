@@ -42,7 +42,7 @@ This plugin enforces governance policies — it intercepts tool calls before the
 Run this command:
 
 ```bash
-openclaw plugins install @inquiryon/openclaw-amp-governance
+openclaw plugins install @inquiryon/amp-governance
 ```
 
 You will see a security warning about network access — this is expected. The plugin sends tool call details to AMP for policy evaluation. The installer will continue automatically.
@@ -50,7 +50,7 @@ You will see a security warning about network access — this is expected. The p
 A successful install ends with:
 
 ```
-Installed plugin: amp-governance
+Installed plugin: openclaw-amp-governance
 Restart the gateway to load plugins.
 ```
 
@@ -160,7 +160,7 @@ Make sure you restarted OpenClaw. Check logs for `[AMP Governance]` lines.
 The plugin reads config from `~/.openclaw/hooks/amp/amp_config.json`. If the file is missing, reinstall the plugin — it will recreate the template on next `gateway_start`.
 
 **Hook files not deployed automatically**
-Check that `~/.openclaw/extensions/amp-governance/hook/` exists. If not, reinstall the plugin. You can also copy the files manually from the `hook/` directory in the [plugin repository](https://github.com/inquiryon/openclaw-amp-governance).
+Check that `~/.openclaw/extensions/openclaw-amp-governance/hook/` exists. If not, reinstall the plugin. You can also copy the files manually from the `hook/` directory in the [plugin repository](https://github.com/inquiryon/openclaw-amp-governance).
 
 **HITL approval times out**
 By default the agent waits up to 10 minutes for a human decision. If no one approves in time, the tool call is blocked. To extend the window, set `HITL_TIMEOUT_MINUTES` in `amp_config.json` (e.g. `30` for 30 minutes) and restart OpenClaw. Make sure you have AMP notifications enabled so you see approval requests promptly.

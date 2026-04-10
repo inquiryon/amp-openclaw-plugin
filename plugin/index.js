@@ -199,7 +199,14 @@ async function notifyUser(sender, message) {
   const prefixed = `[AMP]\n${message}`;
   console.log(`[AMP Governance] Sending notification to ${sender.from}: ${message}`);
   try {
-    await _runtime.channel.whatsapp.sendMessageWhatsApp(sender.from, prefixed, { verbose: false });
+    const channelId = sender.channelId || '';
+    if (channelId === 'slack' || sender.from.startsWith('slack:')) {
+      // Strip the 'slack:' prefix — sendMessageSlack expects 'channel:<id>' or 'user:<id>', not 'slack:channel:<id>'
+      const slackTarget = sender.from.startsWith('slack:') ? sender.from.slice('slack:'.length) : sender.from;
+      await _runtime.channel.slack.sendMessageSlack(slackTarget, prefixed);
+    } else {
+      await _runtime.channel.whatsapp.sendMessageWhatsApp(sender.from, prefixed, { verbose: false });
+    }
   } catch (err) {
     console.warn('[AMP Governance] notifyUser failed:', err.message);
   }

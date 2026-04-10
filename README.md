@@ -45,7 +45,7 @@ An OpenClaw hook that runs inside the gateway process. It handles the per-conver
 - Closes the instance when the conversation ends
 
 ### 2. AMP Governance Plugin (`plugin/index.js`)
-An OpenClaw plugin published to npm as `@inquiryon/openclaw-amp-governance`. It intercepts every tool call before execution and enforces the AMP governance policy:
+An OpenClaw plugin published to npm as `@inquiryon/amp-governance`. It intercepts every tool call before execution and enforces the AMP governance policy:
 - Calls `/api/hitl/request` on the AMP backend
 - If HITL is required: sends an immediate WhatsApp notification and polls for a human decision
 - Returns `{ block: true, blockReason }` to block the tool, or `{}` to allow it
@@ -59,7 +59,7 @@ See the full setup guide: [docs/AMP-GOVERNANCE-SETUP.md](docs/AMP-GOVERNANCE-SET
 
 ```bash
 # 1. Install the plugin (also auto-deploys the hook files)
-openclaw plugins install @inquiryon/openclaw-amp-governance
+openclaw plugins install @inquiryon/amp-governance
 
 # 2. Fill in your AMP credentials
 nano ~/.openclaw/hooks/amp/amp_config.json
@@ -100,7 +100,7 @@ A sample policy template covering web search, file access, bash, payments, stock
 The plugin is published to npm:
 
 ```
-@inquiryon/openclaw-amp-governance
+@inquiryon/amp-governance
 ```
 
-Latest version and changelog: [npmjs.com/package/@inquiryon/openclaw-amp-governance](https://www.npmjs.com/package/@inquiryon/openclaw-amp-governance)
+Latest version and changelog: [npmjs.com/package/@inquiryon/amp-governance](https://www.npmjs.com/package/@inquiryon/amp-governance)
