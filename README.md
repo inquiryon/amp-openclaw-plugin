@@ -50,6 +50,7 @@ An OpenClaw plugin published to npm as `@inquiryon/amp-governance`. It intercept
 - If HITL is required: sends an immediate WhatsApp notification and polls for a human decision
 - Returns `{ block: true, blockReason }` to block the tool, or `{}` to allow it
 - On decision (approve/reject/timeout): sends a follow-up WhatsApp notification
+- If AMP is unreachable or not configured correctly: blocks tool execution as a safety measure, notifies the user, and resumes normal operation automatically once AMP recovers
 
 ## Quick Start
 
