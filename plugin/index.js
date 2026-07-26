@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import { normalizeTool } from './toolNormalization.js';
 
 console.log('[AMP Governance] Plugin module loaded — Phase 4.');
 
@@ -55,13 +56,10 @@ let _lastSender = null;  // { from: string, channelId: string }
 // Set by register() so notifyUser can use the runtime API directly
 let _runtime = null;
 
-// AMP reachability state — flips to false on first connectivity failure,
-// back to true when a request succeeds again.
+// AMP reachability state — flips to false when a real AMP call fails,
+// back to true the next time a real AMP call succeeds.
 let _ampReachable = true;
 let _ampDownNotified = false; // prevent notification spam while AMP is down
-let _recoveryPoller = null;   // setInterval handle for recovery polling
-
-const RECOVERY_POLL_INTERVAL_MS = 15000; // 15 seconds
 
 // ── HOOK AUTO-DEPLOY ─────────────────────────────────────────────────────────
 
@@ -113,6 +111,12 @@ function writeSession(instanceId) {
   } catch (err) {
     console.error('[AMP Governance] writeSession failed:', err.message);
   }
+}
+
+function clearSession() {
+  try {
+    fs.unlinkSync(SESSION_FILE);
+  } catch {}
 }
 
 // ── INSTANCE MANAGEMENT ──────────────────────────────────────────────────────
@@ -223,39 +227,13 @@ async function notifyUser(sender, message) {
 }
 
 /**
- * Lightweight AMP reachability check — does a quick HTTP GET to a known
- * endpoint. Any HTTP response (even 4xx) means AMP is up; a network-level
- * error (ECONNREFUSED, ETIMEDOUT, etc.) means it is down.
- * Returns true if reachable, false if not.
- */
-async function pingAmp() {
-  try {
-    const apiKey = getAmpApiKey();
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 4000); // 4 s timeout
-    try {
-      await fetch(buildAmpUrl('/api/amp/sse-status'), {
-        method: 'GET',
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(timer);
-    }
-    return true;  // any HTTP response = server is up
-  } catch (_) {
-    return false; // connection refused / timeout / DNS failure
-  }
-}
-
-/**
- * Called whenever AMP is found to be unreachable.
+ * Called whenever a real AMP call fails (init or hitl/request).
  * Sends a clear channel notification on the first occurrence, then stays quiet
  * until AMP recovers (to avoid flooding the user with repeated messages).
  */
 async function notifyAmpDown(tool, errDetail) {
   const ampUrl = (() => { try { return buildAmpUrl('/'); } catch (_) { return config?.AMP_BACKEND_URL || 'unknown'; } })();
 
-  startRecoveryPoller();
   if (!_ampDownNotified) {
     _ampDownNotified = true;
     const msg =
@@ -275,40 +253,18 @@ async function notifyAmpDown(tool, errDetail) {
 }
 
 /**
- * Called when AMP responds successfully after a period of being down.
- * Clears the down state and stops the recovery poller.
+ * Called when a real AMP call succeeds after a period of being down.
+ * Clears the down state so the next failure notifies again.
  */
 async function notifyAmpRecovered() {
   if (!_ampReachable) {
     _ampReachable    = true;
     _ampDownNotified = false;
-    stopRecoveryPoller();
     await notifyUser(_lastSender,
       `✅ *AMP Governance Service Restored*\n\nThe AMP Governance service is back online. OpenClaw is resuming normal operation — your next request will be processed.`
     );
     console.log('[AMP Governance] AMP service recovered — resuming normal operation.');
   }
-}
-
-function stopRecoveryPoller() {
-  if (_recoveryPoller !== null) {
-    clearInterval(_recoveryPoller);
-    _recoveryPoller = null;
-    console.log('[AMP Governance] Recovery poller stopped.');
-  }
-}
-
-function startRecoveryPoller() {
-  if (_recoveryPoller !== null) return; // already running
-  console.log(`[AMP Governance] Starting recovery poller (every ${RECOVERY_POLL_INTERVAL_MS / 1000}s)...`);
-  _recoveryPoller = setInterval(async () => {
-    const reachable = await pingAmp();
-    if (reachable) {
-      await notifyAmpRecovered();
-    } else {
-      console.log('[AMP Governance] Recovery poll: AMP still unreachable.');
-    }
-  }, RECOVERY_POLL_INTERVAL_MS);
 }
 
 // ── HITL POLICY ENGINE ───────────────────────────────────────────────────────
@@ -319,6 +275,7 @@ function startRecoveryPoller() {
  */
 async function requestHitlEval(instanceId, tool, params) {
   const apiKey = getAmpApiKey();
+  const { tool: normTool, action: normAction } = normalizeTool(tool, params);
   const res = await fetch(buildAmpUrl('/api/hitl/request'), {
     method: 'POST',
     headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
@@ -327,8 +284,8 @@ async function requestHitlEval(instanceId, tool, params) {
       instance_id: instanceId,
       org_id:     config.AMP_ORG_ID,
       agent_name: config.AGENT_NAME,
-      tool,
-      action:     params?.action || '*',
+      tool:       normTool,
+      action:     normAction,
       context:    params || {},
       hitl: {
         enable: true,
@@ -393,7 +350,8 @@ async function checkToolPolicy(instanceId, tool, params) {
   }
 
   const status = hitlResponse.status;
-  const reason = hitlResponse.reason || hitlResponse.information || '';
+  const rawReason = hitlResponse.reason || hitlResponse.information || '';
+  const reason = typeof rawReason === 'string' ? rawReason : JSON.stringify(rawReason);
   await ampLog(instanceId, `Policy decision: ${tool} | status=${status}${reason ? ` | ${reason}` : ''}`);
 
   // ── No policy configured — block ─────────────────────────────────────────
@@ -582,24 +540,14 @@ export default {
     api.on('session_start', () => {
       console.log('[AMP Governance] Session started — clearing instance cache.');
       _instanceId = null;
+      clearSession();
     });
 
-    // ── INBOUND MESSAGE: cache sender + probe AMP health ─────────────────────
+    // ── INBOUND MESSAGE: cache sender for HITL/outage notifications ──────────
     api.on('message_received', async (event, ctx) => {
       if (event.from && ctx.channelId) {
         _lastSender = { from: event.from, channelId: ctx.channelId };
         console.log(`[AMP Governance] Sender cached: ${event.from} on ${ctx.channelId}`);
-      }
-      // Probe AMP on every inbound message so we catch outages even when the
-      // agent responds without using any tools (e.g. simple greetings).
-      // pingAmp() does a real HTTP check — bypasses any cached instance state.
-      const reachable = await pingAmp();
-      if (!reachable) {
-        _ampReachable = false;
-        await notifyAmpDown('(inbound message)',
-          'Could not reach AMP Governance service — backend may be down or unreachable.');
-      } else if (!_ampReachable) {
-        await notifyAmpRecovered();
       }
     });
 
