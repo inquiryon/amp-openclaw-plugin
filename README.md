@@ -55,7 +55,7 @@ Alternatively, log in to AMP at `https://amp.inquiryon.com` → **Agents** → *
 
 **2. Create (or use) an AMP API Key** — after registering, the agent detail page shows your **Agent Name**, **Org ID**, and **API Key**. Keep these handy for Step 5.
 
-**3. Attach a governance policy** — on the agent's page, click **Write New Policy** → **eval-policy** → use the AI icon to generate a starter policy → activate it. Without an active policy, your agent's tool calls are **blocked by default**. (Policy type and `hitl_spec` details are in [Governance Policy](#governance-policy) below.)
+**3. Attach a governance policy** — on the agent's page, click **Write New Policy** → **Rule-based Policy** → use the AI icon to generate a starter policy → activate it. Without an active policy, your agent's tool calls are **blocked by default**. (Policy type and `hitl_spec` details are in [Governance Policy](#governance-policy) below.)
 
 **4. Install the AOC plugin** — on the machine running OpenClaw, run one command:
 
@@ -233,15 +233,15 @@ Because (1) and (3) are independent, a stuck session can need clearing on either
 
 Policies are defined in AMP and stored as `policy.json` under the agent's directory. When writing a policy in the AMP UI, you choose a policy type:
 
-- **Eval Policy** — define rules using simple expressions (e.g. block web searches for certain keywords, require approval before writing files). Supports three evaluator types:
+- **Rule-based Policy** (also called eval-policy in AMP's code/API) — define rules using simple expressions (e.g. block web searches for certain keywords, require approval before writing files). Supports three evaluator types:
 
   | Type | Description |
   |---|---|
   | `compute` | Fast Python-style formula (e.g. keyword matching, numeric thresholds) |
   | `llm` | LLM semantic reasoning — assesses intent, not just keywords |
-  | `hybrid` | Runs `compute` first; only falls through to `llm` if the compute check didn't already trigger. There is no configurable mode (no `compute_then_llm`/`llm_then_compute`/`either`/`both` setting) — this fixed order is the only behavior, confirmed against AMP's actual eval-policy engine. |
+  | `hybrid` | Runs `compute` first; only falls through to `llm` if the compute check didn't already trigger. There is no configurable mode (no `compute_then_llm`/`llm_then_compute`/`either`/`both` setting) — this fixed order is the only behavior, confirmed against AMP's actual policy engine. |
 
-- **RLHF Policy** — start by approving/rejecting actions manually; AMP learns your preferences and gradually automates decisions over time.
+- **Adaptive Policy** (also called rlhf-policy in AMP's code/API) — start by approving/rejecting actions manually; AMP learns your preferences and gradually automates decisions over time.
 
 HITL routing is configured via `hitl_spec` in the policy:
 
