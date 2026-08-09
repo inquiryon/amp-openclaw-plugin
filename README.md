@@ -202,6 +202,8 @@ AOC is a thin, direct consumer of AMP's REST API — `X-API-Key`-authenticated H
 
 **Polling, not callback:** like Hermes's AHP plugin, AOC polls `/api/hitl/get-decision` rather than using AMP's optional `callback` field — an OpenClaw agent connected to WhatsApp typically runs on infrastructure with no public URL for AMP to call back to, so polling is the reliable default.
 
+**`notify` (not currently set by AOC):** `/api/hitl/request` also accepts an optional `hitl.notify` array (e.g. `["email"]`) — AMP sends an email alert to the reviewer when the workitem is created, independent of AOC's own WhatsApp/Slack notification above. AOC doesn't set this today since its own channel notification already covers the alert; it's available if you want AMP's email as a backup or in addition. Note this is a request-body field the plugin itself would set (`requestHitlEval()`'s `hitl` object) — unlike `who`/`what`/`where`, it is not currently resolved from a policy's `hitl_spec`.
+
 AOC does not perform a separate reachability probe against AMP — outage detection (below) is purely a byproduct of these same calls succeeding or failing, not a dedicated health-check endpoint.
 
 ## AMP Outage Detection
