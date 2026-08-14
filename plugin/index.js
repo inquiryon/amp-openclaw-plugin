@@ -1,10 +1,24 @@
 import * as fs from 'fs';
+import * as path from 'path';
+import { execFileSync } from 'child_process';
 import { normalizeTool } from './toolNormalization.js';
 
 console.log('[AMP Governance] Plugin module loaded — Phase 4.');
 
+// Mirrors OpenClaw's own state-dir resolution (resolveConfigDir in its
+// bundled source): OPENCLAW_STATE_DIR (or legacy CLAWDBOT_STATE_DIR) wins if
+// set — which is how --profile/--dev relocate state to ~/.openclaw-<name> —
+// otherwise fall back to ~/.openclaw. Hardcoding ~/.openclaw here would
+// silently read/write the wrong file for any non-default profile.
+function resolveOpenClawStateDir() {
+  const override = (process.env.OPENCLAW_STATE_DIR || process.env.CLAWDBOT_STATE_DIR || '').trim();
+  if (override) return override;
+  return `${process.env.HOME}/.openclaw`;
+}
+
+const OPENCLAW_STATE_DIR = resolveOpenClawStateDir();
 const SESSION_FILE = '/tmp/amp-session-state.json';
-const CONFIG_FILE = `${process.env.HOME}/.openclaw/hooks/amp/amp_config.json`;
+const CONFIG_FILE = `${OPENCLAW_STATE_DIR}/hooks/amp/amp_config.json`;
 
 // Tools that are internal/noisy — skip logging and policy checks
 const SKIP_TOOLS = new Set(['session_status', 'heartbeat']);
@@ -65,12 +79,14 @@ let _ampDownNotified = false; // prevent notification spam while AMP is down
 
 /**
  * On first install (or if the hook dir is missing), copy the bundled hook
- * files from the plugin's install directory into ~/.openclaw/hooks/amp/.
+ * files from the plugin's install directory into the resolved OpenClaw state
+ * dir's hooks/amp/ (see resolveOpenClawStateDir — respects OPENCLAW_STATE_DIR
+ * / --profile / --dev, not just the ~/.openclaw default).
  * Never overwrites an existing amp_config.json so user credentials are safe.
  */
 function deployHookFilesIfNeeded(pluginRootDir) {
   const hookSrc  = `${pluginRootDir}/hook`;
-  const hookDest = `${process.env.HOME}/.openclaw/hooks/amp`;
+  const hookDest = `${OPENCLAW_STATE_DIR}/hooks/amp`;
 
   try {
     if (!fs.existsSync(hookSrc)) {
@@ -95,6 +111,55 @@ function deployHookFilesIfNeeded(pluginRootDir) {
   } catch (err) {
     console.error('[AMP Governance] Hook auto-deploy failed:', err.message);
   }
+}
+
+// ── `openclaw amp connect` ───────────────────────────────────────────────────
+// Collapses the config-write + hook-enable + gateway-restart steps into one
+// narrated command. Doesn't (and structurally can't) cover plugin install —
+// a plugin's own CLI command only exists once the plugin is already loaded,
+// so `openclaw plugins install @inquiryon/amp-governance` stays a separate
+// first step. Shells out to the real `hooks enable` / `gateway restart`
+// commands (stdio inherited) rather than reimplementing their internals, so
+// behavior stays identical to running them by hand.
+function runAmpConnect(opts) {
+  console.log(`→ Writing config to ${CONFIG_FILE}`);
+  try {
+    fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
+    const newConfig = {
+      AMP_BACKEND_URL: opts.backendUrl,
+      AMP_API_KEY: opts.apiKey,
+      AGENT_NAME: opts.agentName,
+      AMP_USERNAME: opts.username,
+      AMP_ORG_ID: opts.orgId,
+      HITL_TIMEOUT_MINUTES: Number(opts.hitlTimeout) || 10,
+    };
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(newConfig, null, 2) + '\n');
+    console.log('✓ Config written.');
+  } catch (err) {
+    console.error(`✗ Failed to write config: ${err.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log('→ Enabling AMP hook (openclaw hooks enable amp)...');
+  try {
+    execFileSync('openclaw', ['hooks', 'enable', 'amp'], { stdio: 'inherit' });
+  } catch (err) {
+    console.error(`✗ Failed to enable hook: ${err.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log('→ Restarting OpenClaw gateway (openclaw gateway restart)...');
+  try {
+    execFileSync('openclaw', ['gateway', 'restart'], { stdio: 'inherit' });
+  } catch (err) {
+    console.error(`✗ Failed to restart gateway: ${err.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log(`✓ Connected — agent "${opts.agentName}" is now governed by AMP.`);
 }
 
 function readSession() {
@@ -531,10 +596,29 @@ export default {
     api.logger.info('AMP Governance registered. Phase 4 - eval policy enforcement active.');
     _runtime = api.runtime;
 
-    // ── HOOK AUTO-DEPLOY on gateway start ────────────────────────────────────
-    api.on('gateway_start', () => {
-      if (api.rootDir) deployHookFilesIfNeeded(api.rootDir);
-    });
+    // ── HOOK AUTO-DEPLOY on registration ─────────────────────────────────────
+    // `api.rootDir` does not exist on this SDK's plugin api (only `api.source`,
+    // the absolute path to this entry file) — derive the plugin root from that.
+    // Deploy directly here rather than deferring to a 'gateway_start' listener:
+    // register() is guaranteed to run on every plugin load, whereas relying on
+    // a later event left this silently dead (api.rootDir was always undefined).
+    if (api.source) deployHookFilesIfNeeded(path.dirname(api.source));
+
+    // ── CLI: `openclaw amp connect` ───────────────────────────────────────────
+    if (typeof api.registerCli === 'function') {
+      api.registerCli(({ program }) => {
+        const amp = program.command('amp').description('AMP governance commands');
+        amp.command('connect')
+          .description('Connect this OpenClaw agent to AMP: writes config, enables the hook, restarts the gateway')
+          .requiredOption('--api-key <key>', 'AMP API key')
+          .requiredOption('--org-id <id>', 'AMP org id')
+          .requiredOption('--username <email>', 'AMP account username')
+          .requiredOption('--agent-name <name>', 'Name for this agent')
+          .option('--backend-url <url>', 'AMP backend URL', 'http://localhost:3000')
+          .option('--hitl-timeout <minutes>', 'HITL approval timeout in minutes', '10')
+          .action(runAmpConnect);
+      }, { commands: ['amp'] });
+    }
 
     // ── SESSION RESET: clear instance cache on /new or /reset ────────────────
     api.on('session_start', () => {
@@ -568,7 +652,7 @@ export default {
             `The AMP Governance plugin has no valid configuration. ` +
             `All OpenClaw activities are blocked until amp_config.json is set up correctly.\n\n` +
             `Please configure AMP_BACKEND_URL, AMP_API_KEY, and AMP_ORG_ID in:\n` +
-            `~/.openclaw/hooks/amp/amp_config.json`
+            CONFIG_FILE
           );
         } else {
           await notifyAmpDown(tool, 'Could not establish an AMP session — backend may be down or unreachable.');
