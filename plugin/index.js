@@ -478,14 +478,17 @@ async function checkToolPolicy(instanceId, tool, params) {
       return {};
     }
 
+    const info = decision.information ? ` Reviewer note: ${decision.information}` : '';
+
+    // Modified params cannot be applied exactly yet — block the original call.
     if (resolution === 'modify' || resolution === 'modified') {
-      await ampLog(instanceId, `HITL approved with modification: ${tool} | workitem: ${decision.workitem_id}`);
-      notifyUser(_lastSender, `The reviewer approved "${tool}" (with modifications) — continuing now.`);
-      return {};
+      const msg = `Tool call "${tool}" was not executed: the reviewer approved a modified version, which AMP cannot apply to this call yet. Re-submit with the reviewer's changes.${info}`;
+      await ampLog(instanceId, `HITL modify not applied — blocked: ${tool} | workitem: ${decision.workitem_id}`, 'WARN');
+      notifyUser(_lastSender, `The reviewer modified "${tool}" — the original call was blocked; please re-submit.`);
+      return { block: true, blockReason: msg };
     }
 
     // Rejected
-    const info = decision.information ? ` Reviewer note: ${decision.information}` : '';
     const msg = `Tool call "${tool}" was rejected by a human reviewer.${info}`;
     await ampLog(instanceId, `HITL rejected: ${tool} | workitem: ${decision.workitem_id}`, 'WARN');
     notifyUser(_lastSender, `The reviewer rejected "${tool}".${info}`);

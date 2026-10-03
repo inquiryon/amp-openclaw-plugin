@@ -135,11 +135,28 @@ describe('checkToolPolicy — A1/A2 behaviour', () => {
     assert.equal(p.stub.count(...DECISION), 0);
   }));
 
-  test('modify resolution blocks (no params applied)', { todo: 'A2' }, (t) => withPlugin(t, 'hitl_modify', async (p) => {
-    const res = await p.callTool('exec', { command: 'echo hi' });
-    assert.equal(res?.block, true);
-    assert.equal(Object.hasOwn(res, 'params'), false);
-  }));
+  for (const resolution of ['modify', 'modified']) {
+    test(`${resolution} resolution blocks (no params applied)`, (t) => withPlugin(t, 'hitl_modify', async (p) => {
+      if (resolution !== 'modify') {
+        p.stub.script('GET /api/hitl/get-decision', [{
+          status: 200,
+          body: {
+            status: 'complete',
+            resolution,
+            information: 'use a safer command',
+            modified_action: { params: { command: 'echo safe' } },
+            workitem_id: 'wi-1',
+          },
+        }]);
+      }
+      const res = await p.callTool('exec', { command: 'echo hi' });
+      assert.equal(res?.block, true);
+      assert.equal(Object.hasOwn(res, 'params'), false);
+      assert.match(res.blockReason, /modified version/);
+      assert.match(res.blockReason, /Re-submit/);
+      assert.match(res.blockReason, /use a safer command/);
+    }));
+  }
 });
 
 // Every named stub mode with its expected outcome. todo = the item that makes it true.
@@ -153,7 +170,7 @@ const MATRIX = [
   { mode: 'down', expect: 'block' },
   { mode: 'hitl_approve', expect: 'allow' },
   { mode: 'hitl_reject', expect: 'block' },
-  { mode: 'hitl_modify', expect: 'block', todo: 'A2' },
+  { mode: 'hitl_modify', expect: 'block' },
   { mode: 'hitl_cancelled', expect: 'block' },
   // 2 pending polls then approve: needs the 50 ms poll interval (A3) to fit the 3 s timeout.
   { mode: 'hitl_slow', expect: 'allow', todo: 'A3' },
