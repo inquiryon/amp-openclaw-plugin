@@ -280,8 +280,12 @@ function clearSession() {
 // ── INSTANCE MANAGEMENT ──────────────────────────────────────────────────────
 
 /**
- * Ensure an AMP instance exists for this session.
- * Priority: in-memory cache → session file → create new via /api/agent/init.
+ * Ensure an AMP instance exists for this process.
+ * Priority: in-memory cache → create new via /api/agent/init.
+ * K2.3: a persisted instance (plugin-session.json) is never reused for
+ * governance. Its newest work item may be one a previous process abandoned,
+ * and a second process on the same state dir would share its caller_id; the
+ * file is written for display / scripts/clear-session.sh only.
  */
 /** ensureInstance() result when /api/agent/init was cut by the call's budget. */
 const INIT_BUDGET_CUT = Symbol('init-budget-cut');
@@ -290,12 +294,6 @@ async function ensureInstance() {
   if (!config) return null;
 
   if (_instanceId) return _instanceId;
-
-  const session = readSession();
-  if (session?.instanceId) {
-    _instanceId = session.instanceId;
-    return _instanceId;
-  }
 
   try {
     const initUrl = buildAmpUrl('/api/agent/init');
@@ -353,7 +351,7 @@ function logSignal() {
 }
 
 async function ampLog(instanceId, message, level = 'INFO') {
-  if (!config) return;
+  if (!config || !instanceId) return;
   try {
     const apiKey = getAmpApiKey();
     await fetch(buildAmpUrl('/api/log'), {
@@ -691,11 +689,45 @@ async function pollHitlDecision(callerId, { signal, boundWorkitemId, actionId, d
   throw new HitlTimeoutError(`HITL decision timed out after ${HITL_TIMEOUT_MS / 60000} minutes`);
 }
 
-// ── PER-INSTANCE REVIEW LOCK (C10) ──────────────────────────────────────────
-// get-decision is instance-scoped, so two calls waiting on the same instance
-// could bind each other's work item. Only one governance request/review is in
-// flight per instance in this process ("one approval at a time").
-const _instanceLocks = new Map(); // instanceId -> tail of the promise chain
+// ── INSTANCE ROTATION (K2.3) ───────────────────────────────────────────────
+// get-decision is scoped by caller_id (this process's instance) and returns
+// the instance's newest work item. A call that ends without accepting the
+// decision for its own work item, after its request may have reached AMP,
+// can leave a work item behind that a later call would bind and act on. Such
+// a call retires its instance; the next call creates a fresh one.
+
+/** Best-effort setState finished for a retired instance: bounded, never awaited, never throws. */
+function finishInstance(instanceId) {
+  let url;
+  try { url = buildAmpUrl('/api/agent/setState'); } catch { return; }
+  fetch(url, {
+    method: 'POST',
+    headers: { 'X-API-Key': getAmpApiKey(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ agent_name: config.AGENT_NAME, instance_id: instanceId, state: 'finished' }),
+    signal: AbortSignal.timeout(AMP_REQUEST_TIMEOUT_MS),
+  })
+    .then((res) => {
+      if (!res.ok) console.warn(`[AMP Governance] setState finished for ${instanceId} returned ${res.status}`);
+      return res.body?.cancel?.();
+    })
+    .catch((err) => console.warn(`[AMP Governance] setState finished for ${instanceId} failed: ${err?.message || err}`));
+}
+
+/** Drops `instanceId` as this process's instance and finishes it in AMP (fire-and-forget). */
+function retireInstance(instanceId) {
+  if (_instanceId === instanceId) _instanceId = null;
+  if (readSession()?.instanceId === instanceId) clearSession();
+  _seenWorkitems.delete(instanceId);
+  console.warn(`[AMP Governance] Retiring AMP instance ${instanceId}: the call ended without a decision for its review; the next call starts a fresh instance.`);
+  finishInstance(instanceId);
+}
+
+// ── PROCESS-WIDE GOVERNANCE LOCK (C10 / K2.3) ───────────────────────────────
+// One governance call at a time per process ("one approval at a time"): two
+// calls waiting on one instance could bind each other's work item, and a call
+// queued behind a retiring call must pick up the fresh instance — so the
+// instance is resolved inside the lock.
+let _governanceTail = null; // tail of the promise chain, null when idle
 
 /** Resolves true once `prev` settles in time; false at `deadline` or on abort. */
 function waitForTurn(prev, deadline, signal) {
@@ -714,58 +746,79 @@ function waitForTurn(prev, deadline, signal) {
   });
 }
 
-/** Queues for the instance lock; returns a release function, or null (blocked). */
-async function acquireInstanceLock(instanceId, deadline, signal) {
-  const prev = _instanceLocks.get(instanceId) ?? Promise.resolve();
+/** Queues for the governance lock; returns a release function, or null (blocked). */
+async function acquireGovernanceLock(deadline, signal) {
+  const prev = _governanceTail ?? Promise.resolve();
   let release;
   const mine = new Promise((resolve) => { release = resolve; });
   const tail = prev.then(() => mine);
-  _instanceLocks.set(instanceId, tail);
+  _governanceTail = tail;
   tail.then(() => {
-    if (_instanceLocks.get(instanceId) === tail) _instanceLocks.delete(instanceId);
+    if (_governanceTail === tail) _governanceTail = null;
   });
   if (await waitForTurn(prev, deadline, signal)) return release;
   release(); // give up our slot; later waiters still wait for `prev`
   return null;
 }
 
-/**
- * Full governance check for a single tool call.
- * Returns {} to allow, or { block: true, blockReason } to block. Never throws.
- * Fails closed on unreachable AMP, non-2xx, no_policy, policy_error,
- * unknown status, poll timeout, and a lock wait past the call's deadline.
- */
-async function checkToolPolicy(instanceId, tool, params, { signal, actionId, deadline } = {}) {
-  const callDeadline = deadline ?? Date.now() + HITL_TIMEOUT_MS;
-  const paramSummary = formatInput(tool, params);
-  await ampLog(instanceId, `Policy check: ${tool} | ${paramSummary}`);
+// ── GOVERNED CALL ───────────────────────────────────────────────────────────
+// Outcome of one governed call: the hook result, and whether the call's
+// instance must be retired (a work item may exist without an accepted decision).
+const allowOutcome = () => ({ result: {}, retire: false });
+const blockOutcome = (blockReason, retire = false) => ({ result: { block: true, blockReason }, retire });
 
-  const contended = _instanceLocks.has(instanceId);
-  const release = await acquireInstanceLock(instanceId, callDeadline, signal);
-  if (!release) {
-    const why = contended ? 'another AMP review is in progress for this agent instance' : 'the call could not start its AMP review in time';
-    const msg = !contended && !signal?.aborted && _hookBudgetLimitMs !== null
-      ? budgetExhaustedMessage(tool)
-      : `Tool call "${tool}" blocked — ${why}${signal?.aborted ? ' (run cancelled while waiting)' : ''}.`;
-    console.warn(`[AMP Governance] ${msg}`);
-    await ampLog(instanceId, msg, 'WARN');
-    return { block: true, blockReason: msg };
-  }
-  try {
-    return await requestAndAwaitDecision(instanceId, tool, params, { signal, actionId, deadline: callDeadline });
-  } finally {
-    release();
-  }
+/** Block when the call could not get its turn (queue wait past the deadline, or run cancelled). */
+async function lockMissBlock(tool, contended, signal) {
+  const why = contended ? 'another AMP review is in progress for this agent' : 'the call could not start its AMP review in time';
+  const msg = !contended && !signal?.aborted && _hookBudgetLimitMs !== null
+    ? budgetExhaustedMessage(tool)
+    : `Tool call "${tool}" blocked — ${why}${signal?.aborted ? ' (run cancelled while waiting)' : ''}.`;
+  console.warn(`[AMP Governance] ${msg}`);
+  await ampLog(_instanceId, msg, 'WARN');
+  return { block: true, blockReason: msg };
 }
 
-/** Request + HITL wait for one call; runs while holding the instance lock. */
+/** Block when no instance could be resolved (not configured, init failed or budget cut). */
+async function noInstanceBlock(tool, instanceId) {
+  if (instanceId === INIT_BUDGET_CUT) {
+    const msg = budgetExhaustedMessage(tool);
+    console.error(`[AMP Governance] ${msg}`);
+    return { block: true, blockReason: msg };
+  }
+  const reason = 'AMP Governance service is unreachable.';
+  console.error(`[AMP Governance] No instance available — blocking tool "${tool}". Reason: ${reason}`);
+  await notifyAmpDown(tool, 'Could not establish an AMP session — backend may be down or unreachable.');
+  return { block: true, blockReason: reason };
+}
+
+/**
+ * Full governance check for one tool call; runs while holding the governance
+ * lock: instance → logs → policy request → HITL wait → retire if needed.
+ * Returns {} to allow, or { block: true, blockReason } to block.
+ */
+async function governedCall(tool, params, { signal, toolCallId, deadline }) {
+  const instanceId = await ensureInstance();
+  if (!instanceId || instanceId === INIT_BUDGET_CUT) return noInstanceBlock(tool, instanceId);
+
+  const paramSummary = formatInput(tool, params);
+  console.log(`[AMP Governance] before_tool_call: ${tool} | instance: ${instanceId}`);
+  await ampLog(instanceId, `Tool call: ${tool} | Input: ${paramSummary}`);
+  await ampLog(instanceId, `Policy check: ${tool} | ${paramSummary}`);
+
+  const actionId = ACTION_ID_CORRELATION ? (toolCallId || randomUUID()) : null;
+  const outcome = await requestAndAwaitDecision(instanceId, tool, params, { signal, actionId, deadline });
+  if (outcome.retire) retireInstance(instanceId);
+  return outcome.result;
+}
+
+/** Request + HITL wait for one call. Returns an outcome ({result, retire}). */
 async function requestAndAwaitDecision(instanceId, tool, params, { signal, actionId, deadline }) {
   // Too little budget left to get an answer: block as a budget miss, not as an AMP outage.
   if (deadline != null && deadline - Date.now() < MIN_REQUEST_BUDGET_MS) {
     const msg = budgetExhaustedMessage(tool);
     console.error(`[AMP Governance] ${msg}`);
     await ampLog(instanceId, msg, 'ERROR');
-    return { block: true, blockReason: msg };
+    return blockOutcome(msg); // nothing was sent: no work item can exist
   }
   let hitlResponse;
   try {
@@ -773,29 +826,41 @@ async function requestAndAwaitDecision(instanceId, tool, params, { signal, actio
     // Successful contact with AMP — clear any prior down state (notification is fire-and-forget)
     notifyAmpRecovered().catch(() => {});
   } catch (err) {
-    const em = err && err.message ? err.message : String(err);
-    console.error(`[AMP Governance] HITL request failed — blocking tool "${tool}": ${em}`);
-    await ampLog(instanceId, `AMP governance check failed — tool "${tool}" blocked: ${em}`, 'ERROR');
-    if (err instanceof InvalidAmpResponseError) {
-      return { block: true, blockReason: `AMP returned an invalid response to the policy check. Tool "${tool}" was blocked as a safety measure.` };
-    }
-    if (signal?.aborted) {
-      return { block: true, blockReason: `Tool call "${tool}" blocked — run cancelled before AMP answered the policy check.` };
-    }
-    // Cut by this call's own deadline (not the per-request cap): a budget miss, not an outage.
-    if (isBudgetCut(err, signal)) {
-      const msg = budgetExhaustedMessage(tool);
-      console.error(`[AMP Governance] ${msg}`);
-      return { block: true, blockReason: msg };
-    }
-    _ampReachable = false;
-    notifyAmpDown(tool, em).catch(() => {}); // fire-and-forget: never holds the call or the instance slot
-    if (isRequestTimeout(err, signal)) {
-      return { block: true, blockReason: `AMP Governance service did not answer the policy check in time. Tool "${tool}" was blocked as a safety measure.` };
-    }
-    return { block: true, blockReason: `AMP Governance service is unreachable. Tool "${tool}" was blocked as a safety measure. Restore the AMP backend and retry.` };
+    return requestFailureOutcome(err, instanceId, tool, signal);
   }
+  return requestResponseOutcome(hitlResponse, instanceId, tool, { signal, actionId, deadline });
+}
 
+/** /api/hitl/request failed. The request may have landed, so the instance is retired. */
+async function requestFailureOutcome(err, instanceId, tool, signal) {
+  const em = err && err.message ? err.message : String(err);
+  console.error(`[AMP Governance] HITL request failed — blocking tool "${tool}": ${em}`);
+  await ampLog(instanceId, `AMP governance check failed — tool "${tool}" blocked: ${em}`, 'ERROR');
+  if (err instanceof InvalidAmpResponseError) {
+    return blockOutcome(`AMP returned an invalid response to the policy check. Tool "${tool}" was blocked as a safety measure.`, true);
+  }
+  if (signal?.aborted) {
+    return blockOutcome(`Tool call "${tool}" blocked — run cancelled before AMP answered the policy check.`, true);
+  }
+  // Cut by this call's own deadline (not the per-request cap): a budget miss, not an outage.
+  if (isBudgetCut(err, signal)) {
+    const msg = budgetExhaustedMessage(tool);
+    console.error(`[AMP Governance] ${msg}`);
+    return blockOutcome(msg, true);
+  }
+  _ampReachable = false;
+  notifyAmpDown(tool, em).catch(() => {}); // fire-and-forget: never holds the call or the lock
+  if (isRequestTimeout(err, signal)) {
+    return blockOutcome(`AMP Governance service did not answer the policy check in time. Tool "${tool}" was blocked as a safety measure.`, true);
+  }
+  return blockOutcome(`AMP Governance service is unreachable. Tool "${tool}" was blocked as a safety measure. Restore the AMP backend and retry.`, true);
+}
+
+const ALLOW_STATUSES = new Set(['no-hitl', 'allow', 'allowed', 'approved']); // mirrors Hermes HP __init__.py:772
+const POLICY_ERROR_STATUSES = new Set(['policy_error', 'config_error', 'error']);
+
+/** Outcome for a parsed /api/hitl/request body. */
+async function requestResponseOutcome(hitlResponse, instanceId, tool, opts) {
   // Never dereference hitlResponse directly: null / array / scalar bodies fail closed below.
   const body = hitlResponse && typeof hitlResponse === 'object' && !Array.isArray(hitlResponse) ? hitlResponse : {};
   // K2: bind to the request's work item at once, before any await — unless the
@@ -809,137 +874,161 @@ async function requestAndAwaitDecision(instanceId, tool, params, { signal, actio
   const reason = typeof rawReason === 'string' ? rawReason : JSON.stringify(rawReason);
   await ampLog(instanceId, `Policy decision: ${tool} | status=${status}${reason ? ` | ${reason}` : ''}`);
 
-  // ── No policy configured — block ─────────────────────────────────────────
   if (status === 'no_policy') {
     const msg = `Tool call "${tool}" blocked — no active governance policy for agent "${config.AGENT_NAME}". Contact your administrator.`;
     await ampLog(instanceId, msg, 'WARN');
-    return { block: true, blockReason: msg };
+    return blockOutcome(msg);
   }
-
-  // ── Eval engine approved — allow (set mirrors Hermes HP __init__.py:772) ──
-  if (status === 'no-hitl' || status === 'allow' || status === 'allowed' || status === 'approved') {
-    if (signal?.aborted) {
-      const msg = `Tool call "${tool}" blocked — run cancelled before the AMP allow could be applied.`;
-      await ampLog(instanceId, msg, 'WARN');
-      return { block: true, blockReason: msg };
-    }
-    console.log(`[AMP Governance] Policy approved: ${tool} (${reason || 'ok'})`);
-    return {};
-  }
-
-  // ── Policy / config error (HTTP 200 from the backend) — block ────────────
-  if (status === 'policy_error' || status === 'config_error' || status === 'error') {
-    const detail = body.message || reason || 'AMP policy is misconfigured';
-    const msg = `Tool call "${tool}" blocked — AMP policy error (${body.reason || status}): ${detail}`;
+  if (ALLOW_STATUSES.has(status)) return allowStatusOutcome(instanceId, tool, reason, opts.signal);
+  if (POLICY_ERROR_STATUSES.has(status)) {
+    const msg = `Tool call "${tool}" blocked — AMP policy error (${body.reason || status}): ${body.message || reason || 'AMP policy is misconfigured'}`;
     console.error(`[AMP Governance] ${msg}`);
     await ampLog(instanceId, msg, 'ERROR');
-    return { block: true, blockReason: msg };
+    return blockOutcome(msg);
   }
-
-  // ── HITL required — wait for human decision ──────────────────────────────
   if (status === 'pending' || status === 'waiting-for-response' || requestWorkitemId) {
-    console.log(`[AMP Governance] HITL required for "${tool}" — waiting for human decision...`);
-    await ampLog(instanceId, `HITL requested for tool: ${tool} — awaiting human approval in AMP`, 'WARN');
-
-    // Notify the user immediately so they aren't staring at silence
-    notifyUser(_lastSender, `I need a reviewer to approve "${tool}" before I can proceed. I'll follow up once the decision is made — this may take a few minutes.`);
-
-    let decision;
-    try {
-      decision = await pollHitlDecision(instanceId, { signal, boundWorkitemId, actionId, deadline });
-    } catch (err) {
-      if (signal?.aborted) {
-        const msg = `Tool call "${tool}" blocked — run cancelled while waiting for AMP review.`;
-        await ampLog(instanceId, msg, 'WARN');
-        return { block: true, blockReason: msg };
-      }
-      if (err instanceof ActionIdCorrelationError) {
-        const msg = `Tool call "${tool}" blocked — ${err.message}`;
-        console.error(`[AMP Governance] ${msg}`);
-        await ampLog(instanceId, msg, 'ERROR');
-        notifyUser(_lastSender, `AMP could not correlate the review for "${tool}" — the call was blocked.`);
-        return { block: true, blockReason: msg };
-      }
-      if (err instanceof UnverifiableDecisionError) {
-        console.error(`[AMP Governance] Tool call "${tool}": ${err.message}`);
-        await ampLog(instanceId, `Tool call "${tool}": ${err.message}`, 'ERROR');
-        notifyUser(_lastSender, `AMP returned a decision for "${tool}" that could not be tied to the call — it was blocked.`);
-        return { block: true, blockReason: err.message };
-      }
-      if (err instanceof PollFatalError) {
-        const msg = `Tool call "${tool}" blocked — AMP rejected the HITL decision poll (HTTP ${err.status}).`;
-        console.error(`[AMP Governance] ${msg} ${err.body}`);
-        await ampLog(instanceId, `${msg} ${err.body}`, 'ERROR');
-        notifyUser(_lastSender, `AMP rejected the review check for "${tool}" (HTTP ${err.status}) — the call was blocked.`);
-        return { block: true, blockReason: msg };
-      }
-      if (!(err instanceof HitlTimeoutError)) {
-        // Network failure (not our request timeout): AMP is unreachable, not the reviewer slow.
-        const em = err?.cause?.code || (err && err.message ? err.message : String(err));
-        const msg = `Tool call "${tool}" blocked — AMP became unreachable while waiting for the AMP review (${em}).`;
-        console.error(`[AMP Governance] ${msg}`);
-        await ampLog(instanceId, msg, 'ERROR');
-        notifyUser(_lastSender, `AMP became unreachable during the review for "${tool}" — the call was blocked.`);
-        return { block: true, blockReason: msg };
-      }
-      const msg = budgetExhaustedMessage(tool);
-      await ampLog(instanceId, msg, 'ERROR');
-      notifyUser(_lastSender, `No response from the reviewer — "${tool}" was blocked due to timeout.`);
-      return { block: true, blockReason: msg };
-    }
-
-    if (isCancelledDecision(decision)) {
-      const msg = `Tool call "${tool}" blocked — the AMP review was cancelled before a decision was made.`;
-      await ampLog(instanceId, `HITL cancelled — blocked: ${tool} | workitem: ${decision.workitem_id}`, 'WARN');
-      notifyUser(_lastSender, `The review for "${tool}" was cancelled — the call was blocked.`);
-      return { block: true, blockReason: msg };
-    }
-
-    const resolution = String(decision.resolution || '').toLowerCase().trim();
-    console.log(`[AMP Governance] HITL decision for "${tool}": ${resolution}`);
-
-    if (resolution === 'approve' || resolution === 'approved') {
-      await ampLog(instanceId, `HITL approved: ${tool} | workitem: ${decision.workitem_id}`);
-      // Last check after the final await: a run cancelled meanwhile must not proceed.
-      if (signal?.aborted) {
-        const msg = `Tool call "${tool}" blocked — run cancelled before the AMP approval could be applied.`;
-        await ampLog(instanceId, `${msg} | workitem: ${decision.workitem_id}`, 'WARN');
-        return { block: true, blockReason: msg };
-      }
-      notifyUser(_lastSender, `The reviewer approved "${tool}" — continuing now.`);
-      return {};
-    }
-
-    const info = decision.information ? ` Reviewer note: ${decision.information}` : '';
-
-    // Modified params cannot be applied exactly yet — block the original call.
-    if (resolution === 'modify' || resolution === 'modified') {
-      const msg = `Tool call "${tool}" was not executed: the reviewer approved a modified version, which AMP cannot apply to this call yet. Re-submit with the reviewer's changes.${info}`;
-      await ampLog(instanceId, `HITL modify not applied — blocked: ${tool} | workitem: ${decision.workitem_id}`, 'WARN');
-      notifyUser(_lastSender, `The reviewer modified "${tool}" — the original call was blocked; please re-submit.`);
-      return { block: true, blockReason: msg };
-    }
-
-    if (resolution === 'reject' || resolution === 'rejected') {
-      const msg = `Tool call "${tool}" was rejected by a human reviewer.${info}`;
-      await ampLog(instanceId, `HITL rejected: ${tool} | workitem: ${decision.workitem_id}`, 'WARN');
-      notifyUser(_lastSender, `The reviewer rejected "${tool}".${info}`);
-      return { block: true, blockReason: msg };
-    }
-
-    // Empty, expired or unknown resolution: no decision to act on (K5).
-    const msg = `Tool call "${tool}": AMP returned no usable decision (resolution=${resolution}) — blocked.`;
-    console.error(`[AMP Governance] ${msg}`);
-    await ampLog(instanceId, `${msg} | workitem: ${decision.workitem_id}`, 'ERROR');
-    notifyUser(_lastSender, `AMP returned no usable decision for "${tool}" — the call was blocked.`);
-    return { block: true, blockReason: msg };
+    return awaitHitlDecision(instanceId, tool, { ...opts, boundWorkitemId });
   }
-
-  // ── Unknown response — fail CLOSED ───────────────────────────────────────
+  // Unknown response — fail CLOSED. The request reached AMP: a work item may exist.
   const msg = `Tool call "${tool}" blocked — AMP returned an unexpected status "${status || 'missing'}".`;
   console.error('[AMP Governance] Unexpected HITL response:', JSON.stringify(hitlResponse));
   await ampLog(instanceId, `${msg} Body: ${JSON.stringify(hitlResponse)}`, 'ERROR');
-  return { block: true, blockReason: msg };
+  return blockOutcome(msg, true);
+}
+
+/** The eval engine allowed the call without review. */
+async function allowStatusOutcome(instanceId, tool, reason, signal) {
+  if (signal?.aborted) {
+    const msg = `Tool call "${tool}" blocked — run cancelled before the AMP allow could be applied.`;
+    await ampLog(instanceId, msg, 'WARN');
+    return blockOutcome(msg);
+  }
+  console.log(`[AMP Governance] Policy approved: ${tool} (${reason || 'ok'})`);
+  return allowOutcome();
+}
+
+/** HITL required: wait for this call's work item, then act on its decision. */
+async function awaitHitlDecision(instanceId, tool, { signal, actionId, deadline, boundWorkitemId }) {
+  console.log(`[AMP Governance] HITL required for "${tool}" — waiting for human decision...`);
+  await ampLog(instanceId, `HITL requested for tool: ${tool} — awaiting human approval in AMP`, 'WARN');
+  // Notify the user immediately so they aren't staring at silence
+  notifyUser(_lastSender, `I need a reviewer to approve "${tool}" before I can proceed. I'll follow up once the decision is made — this may take a few minutes.`);
+  let decision;
+  try {
+    decision = await pollHitlDecision(instanceId, { signal, boundWorkitemId, actionId, deadline });
+  } catch (err) {
+    // The wait ended without an accepted decision: retire the instance (K2.3).
+    return blockOutcome(await pollFailureMessage(err, instanceId, tool, signal), true);
+  }
+  return decisionOutcome(decision, instanceId, tool, signal);
+}
+
+/** Block message (logged + notified) for a HITL wait that ended without a decision. */
+async function pollFailureMessage(err, instanceId, tool, signal) {
+  const fail = async (msg, level, note) => {
+    if (level === 'ERROR') console.error(`[AMP Governance] ${msg}`);
+    await ampLog(instanceId, msg, level);
+    if (note) notifyUser(_lastSender, note);
+    return msg;
+  };
+  if (signal?.aborted) return fail(`Tool call "${tool}" blocked — run cancelled while waiting for AMP review.`, 'WARN');
+  if (err instanceof ActionIdCorrelationError) {
+    return fail(`Tool call "${tool}" blocked — ${err.message}`, 'ERROR', `AMP could not correlate the review for "${tool}" — the call was blocked.`);
+  }
+  if (err instanceof UnverifiableDecisionError) {
+    console.error(`[AMP Governance] Tool call "${tool}": ${err.message}`);
+    await ampLog(instanceId, `Tool call "${tool}": ${err.message}`, 'ERROR');
+    notifyUser(_lastSender, `AMP returned a decision for "${tool}" that could not be tied to the call — it was blocked.`);
+    return err.message;
+  }
+  if (err instanceof PollFatalError) {
+    const msg = `Tool call "${tool}" blocked — AMP rejected the HITL decision poll (HTTP ${err.status}).`;
+    console.error(`[AMP Governance] ${msg} ${err.body}`);
+    await ampLog(instanceId, `${msg} ${err.body}`, 'ERROR');
+    notifyUser(_lastSender, `AMP rejected the review check for "${tool}" (HTTP ${err.status}) — the call was blocked.`);
+    return msg;
+  }
+  if (!(err instanceof HitlTimeoutError)) {
+    // Network failure (not our request timeout): AMP is unreachable, not the reviewer slow.
+    const em = err?.cause?.code || (err && err.message ? err.message : String(err));
+    return fail(`Tool call "${tool}" blocked — AMP became unreachable while waiting for the AMP review (${em}).`, 'ERROR',
+      `AMP became unreachable during the review for "${tool}" — the call was blocked.`);
+  }
+  const msg = budgetExhaustedMessage(tool);
+  await ampLog(instanceId, msg, 'ERROR');
+  notifyUser(_lastSender, `No response from the reviewer — "${tool}" was blocked due to timeout.`);
+  return msg;
+}
+
+/** Outcome for the accepted decision of this call's own work item (never retires). */
+async function decisionOutcome(decision, instanceId, tool, signal) {
+  const wi = decision.workitem_id;
+  const block = async (msg, logMsg, level, note) => {
+    if (level === 'ERROR') console.error(`[AMP Governance] ${msg}`);
+    await ampLog(instanceId, logMsg, level);
+    if (note) notifyUser(_lastSender, note);
+    return blockOutcome(msg);
+  };
+  if (isCancelledDecision(decision)) {
+    return block(`Tool call "${tool}" blocked — the AMP review was cancelled before a decision was made.`,
+      `HITL cancelled — blocked: ${tool} | workitem: ${wi}`, 'WARN', `The review for "${tool}" was cancelled — the call was blocked.`);
+  }
+  const resolution = String(decision.resolution || '').toLowerCase().trim();
+  console.log(`[AMP Governance] HITL decision for "${tool}": ${resolution}`);
+  if (resolution === 'approve' || resolution === 'approved') return approvedOutcome(instanceId, tool, wi, signal);
+  const info = decision.information ? ` Reviewer note: ${decision.information}` : '';
+  // Modified params cannot be applied exactly yet — block the original call.
+  if (resolution === 'modify' || resolution === 'modified') {
+    return block(`Tool call "${tool}" was not executed: the reviewer approved a modified version, which AMP cannot apply to this call yet. Re-submit with the reviewer's changes.${info}`,
+      `HITL modify not applied — blocked: ${tool} | workitem: ${wi}`, 'WARN', `The reviewer modified "${tool}" — the original call was blocked; please re-submit.`);
+  }
+  if (resolution === 'reject' || resolution === 'rejected') {
+    return block(`Tool call "${tool}" was rejected by a human reviewer.${info}`,
+      `HITL rejected: ${tool} | workitem: ${wi}`, 'WARN', `The reviewer rejected "${tool}".${info}`);
+  }
+  // Empty, expired or unknown resolution: no decision to act on (K5).
+  const msg = `Tool call "${tool}": AMP returned no usable decision (resolution=${resolution}) — blocked.`;
+  return block(msg, `${msg} | workitem: ${wi}`, 'ERROR', `AMP returned no usable decision for "${tool}" — the call was blocked.`);
+}
+
+/** The reviewer approved this call's work item. */
+async function approvedOutcome(instanceId, tool, wi, signal) {
+  await ampLog(instanceId, `HITL approved: ${tool} | workitem: ${wi}`);
+  // Last check after the final await: a run cancelled meanwhile must not proceed.
+  if (signal?.aborted) {
+    const msg = `Tool call "${tool}" blocked — run cancelled before the AMP approval could be applied.`;
+    await ampLog(instanceId, `${msg} | workitem: ${wi}`, 'WARN');
+    return blockOutcome(msg);
+  }
+  notifyUser(_lastSender, `The reviewer approved "${tool}" — continuing now.`);
+  return allowOutcome();
+}
+
+/** before_tool_call body: skip list, config check, governance lock, governed call. */
+async function beforeToolCall(event, ctx, callDeadline) {
+  const tool = event.toolName || event.name || 'unknown-tool';
+  if (SKIP_TOOLS.has(tool)) return {};
+  if (!config) {
+    const reason = 'AMP Governance plugin is not configured (amp_config.json missing or invalid).';
+    console.error(`[AMP Governance] No instance available — blocking tool "${tool}". Reason: ${reason}`);
+    await notifyUser(_lastSender,
+      `🚨 *AMP Governance Not Configured*\n\n` +
+      `The AMP Governance plugin has no valid configuration. ` +
+      `All OpenClaw activities are blocked until amp_config.json is set up correctly.\n\n` +
+      `Please configure AMP_BACKEND_URL, AMP_API_KEY, and AMP_ORG_ID in:\n` +
+      CONFIG_FILE
+    );
+    return { block: true, blockReason: reason };
+  }
+  const signal = ctx?.abortSignal;
+  const contended = _governanceTail !== null;
+  const release = await acquireGovernanceLock(callDeadline, signal);
+  if (!release) return lockMissBlock(tool, contended, signal);
+  try {
+    return await governedCall(tool, event.params, { signal, toolCallId: event.toolCallId, deadline: callDeadline });
+  } finally {
+    release();
+  }
 }
 
 // ── TEXT FORMATTING HELPERS ──────────────────────────────────────────────────
@@ -1121,51 +1210,13 @@ export default {
       return _callScope.run({ deadline: callDeadline }, () => beforeToolCall(event, ctx, callDeadline));
     }, { timeoutMs: HOOK_TIMEOUT_MS });
 
-    async function beforeToolCall(event, ctx, callDeadline) {
-      const tool = event.toolName || event.name || 'unknown-tool';
-      if (SKIP_TOOLS.has(tool)) return {};
-
-      const instanceId = await ensureInstance();
-      if (instanceId === INIT_BUDGET_CUT) {
-        const msg = budgetExhaustedMessage(tool);
-        console.error(`[AMP Governance] ${msg}`);
-        return { block: true, blockReason: msg };
-      }
-      if (!instanceId) {
-        const reason = !config
-          ? 'AMP Governance plugin is not configured (amp_config.json missing or invalid).'
-          : 'AMP Governance service is unreachable.';
-        console.error(`[AMP Governance] No instance available — blocking tool "${tool}". Reason: ${reason}`);
-        if (!config) {
-          await notifyUser(_lastSender,
-            `🚨 *AMP Governance Not Configured*\n\n` +
-            `The AMP Governance plugin has no valid configuration. ` +
-            `All OpenClaw activities are blocked until amp_config.json is set up correctly.\n\n` +
-            `Please configure AMP_BACKEND_URL, AMP_API_KEY, and AMP_ORG_ID in:\n` +
-            CONFIG_FILE
-          );
-        } else {
-          await notifyAmpDown(tool, 'Could not establish an AMP session — backend may be down or unreachable.');
-        }
-        return { block: true, blockReason: reason };
-      }
-
-      // Log the incoming tool call
-      const message = `Tool call: ${tool} | Input: ${formatInput(tool, event.params)}`;
-      console.log(`[AMP Governance] before_tool_call: ${tool} | instance: ${instanceId}`);
-      await ampLog(instanceId, message);
-
-      // Governance check — returns {} to allow or { block, blockReason } to block
-      const actionId = ACTION_ID_CORRELATION ? (event.toolCallId || randomUUID()) : null;
-      return await checkToolPolicy(instanceId, tool, event.params, { signal: ctx?.abortSignal, actionId, deadline: callDeadline });
-    }
-
     // ── AFTER TOOL CALL: result logging ──────────────────────────────────────
     api.on('after_tool_call', async (event) => {
       const tool = event.toolName || event.name || 'unknown-tool';
       if (SKIP_TOOLS.has(tool)) return;
 
-      const instanceId = _instanceId || readSession()?.instanceId;
+      // Only this process's live instance (K2.3): never a persisted one.
+      const instanceId = _instanceId;
       if (!instanceId) return;
 
       const result   = event.result ?? event.output ?? event.toolOutput;
@@ -1180,7 +1231,7 @@ export default {
 
     // ── OUTBOUND MESSAGE LOGGING ──────────────────────────────────────────────
     api.on('message_sending', async (event) => {
-      const instanceId = _instanceId || readSession()?.instanceId;
+      const instanceId = _instanceId; // K2.3: never a persisted instance
       const msgText    = event.content || event.text || event.message || JSON.stringify(event);
       const preview    = msgText.substring(0, 100);
       if (instanceId) {

@@ -91,23 +91,19 @@ describe('K2 — bind each call to its own work item', () => {
     assert.ok(p.stub.count(...DECISION) > 1);
   }));
 
-  test('after a restart the stale decision of the restored instance is never accepted', (t) => withPlugin(t, async (p) => {
+  test('after a restart the persisted instance is not reused, so its stale decision is never seen (K2.3)', (t) => withPlugin(t, async (p) => {
     fs.writeFileSync(
       path.join(p.stateDir, 'hooks', 'amp', 'plugin-session.json'),
       JSON.stringify({ instanceId: 'inst-old', writer: 'plugin' }),
     );
     p.stub.script('POST /api/hitl/request', [pending(null)]);
-    p.stub.script('GET /api/hitl/get-decision', [
-      done('approve', 'wi-old'),
-      pending('wi-2'),
-      done('reject', 'wi-2'),
-    ]);
+    p.stub.script('GET /api/hitl/get-decision', [pending('wi-2'), done('reject', 'wi-2')]);
     const res = await exec(p);
     assert.equal(res?.block, true, `must not allow: ${JSON.stringify(res)}`);
     assert.match(res.blockReason, /rejected by a human reviewer/);
-    assert.equal(p.stub.count('POST', '/api/agent/init'), 0, 'restored instance must be reused');
-    assert.equal(p.stub.requests((r) => r.path === '/api/hitl/request')[0].body.instance_id, 'inst-old');
-    assert.equal(p.stub.count(...DECISION), 3);
+    assert.equal(p.stub.count('POST', '/api/agent/init'), 1, 'a fresh instance is created');
+    assert.equal(p.stub.requests((r) => r.path === '/api/hitl/request')[0].body.instance_id, 'inst-1');
+    assert.equal(p.stub.requests((r) => r.query?.caller_id === 'inst-old').length, 0);
   }));
 
   test('unbound terminal ids are remembered and never accepted later', (t) => withPlugin(t, async (p) => {
@@ -178,7 +174,7 @@ const indexesOf = (p, method, urlPath) => p.stub.requests()
 const policyChecks = (p) => p.stub.requests((r) => r.path === '/api/log'
   && /^Policy check:/.test(r.body?.message || '')).length;
 
-describe('C10 — one AMP review at a time per instance', () => {
+describe('C10 — one AMP review at a time per process', () => {
   test('two concurrent unbound calls are serialized and cannot cross-bind', (t) => withPlugin(t, async (p) => {
     await approvedFirstCall(p); // warm the instance so both calls share it
     const base = p.stub.requests().length;
@@ -217,7 +213,7 @@ describe('C10 — one AMP review at a time per instance', () => {
     assert.ok(reqs[1] > polls[2], 'no-hitl request must wait for the pending review to finish');
   }));
 
-  test('a call aborted while waiting for the instance blocks without a request', (t) => withPlugin(t, async (p) => {
+  test('a call aborted while waiting for its turn blocks without a request', (t) => withPlugin(t, async (p) => {
     p.stub.script('POST /api/hitl/request', [pending('wi-1'), pending(null)]);
     p.stub.script('GET /api/hitl/get-decision', [pending('wi-1')]);
     const ac1 = new AbortController();
@@ -225,11 +221,14 @@ describe('C10 — one AMP review at a time per instance', () => {
     const first = p.callTool('exec', { command: 'echo 1' }, { abortSignal: ac1.signal });
     await waitFor(() => p.stub.count(...DECISION) >= 1, 'first call polling');
     const second = p.callTool('exec', { command: 'echo 2' }, { abortSignal: ac2.signal });
-    await waitFor(() => policyChecks(p) >= 2, 'second call policy check');
+    // The queued call makes no AMP request before its turn (the instance is resolved
+    // inside the lock, K2.3), so there is nothing to wait on: give it a moment to queue.
+    await new Promise((r) => setTimeout(r, 100));
     ac2.abort();
     const res2 = await second;
     assert.equal(res2?.block, true, JSON.stringify(res2));
-    assert.match(res2.blockReason, /another AMP review is in progress for this agent instance/);
+    assert.match(res2.blockReason, /another AMP review is in progress for this agent \(run cancelled while waiting\)/);
+    assert.equal(policyChecks(p), 1, 'the queued call never started its policy check');
     assert.equal(p.stub.count('POST', '/api/hitl/request'), 1, 'aborted waiter must not send a request');
     ac1.abort();
     const res1 = await first;
