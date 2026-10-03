@@ -466,6 +466,14 @@ async function notifyAmpRecovered() {
 // /api/hitl/request answered 2xx with a body that is not JSON.
 class InvalidAmpResponseError extends Error {}
 
+// /api/hitl/request answered HTTP 4xx: AMP is up and refused the request (LOW2).
+class AmpRejectedRequestError extends Error {
+  constructor(status) {
+    super(`/api/hitl/request returned HTTP ${status}`);
+    this.status = status;
+  }
+}
+
 /**
  * Call /api/hitl/request with the tool call details.
  * The AMP backend eval engine decides allow vs HITL.
@@ -493,6 +501,10 @@ async function requestHitlEval(instanceId, tool, params, actionId, { signal, dea
     }),
     signal: requestSignal(signal, deadline),
   });
+  if (res.status >= 400 && res.status < 500) {
+    await res.body?.cancel?.();
+    throw new AmpRejectedRequestError(res.status);
+  }
   if (!res.ok) throw new Error(`/api/hitl/request returned HTTP ${res.status}`);
   try {
     return await res.json();
@@ -519,7 +531,7 @@ function sleep(ms, signal) {
 }
 
 // Poll statuses that will not change by retrying (auth, unknown route, call limit).
-const POLL_FATAL_STATUS = new Set([401, 403, 404, 429]);
+const POLL_FATAL_STATUS = new Set([400, 401, 403, 404, 429]);
 
 /** A6: the correlated poll cannot be trusted (no echo, or no work item in time). */
 class ActionIdCorrelationError extends Error {}
@@ -654,7 +666,7 @@ function checkActionIdWatchdog(actionId, bound, started) {
  * Poll /api/hitl/get-decision until this call's work item is complete (or
  * cancelled) or the call's deadline passes. Binds to `boundWorkitemId`, else to the
  * first unseen workitem_id in a pending body (see classifyDecision).
- * Throws PollFatalError on HTTP 401/403/404/429; other failures keep polling.
+ * Throws PollFatalError on HTTP 400/401/403/404/429; other failures keep polling.
  * Rejects as soon as `signal` aborts (run cancelled). A bound id stays in the
  * instance set on every exit, so an abandoned work item is never accepted later.
  */
@@ -846,11 +858,18 @@ async function requestAndAwaitDecision(instanceId, tool, params, { signal, actio
   return requestResponseOutcome(hitlResponse, instanceId, tool, { signal, actionId, deadline });
 }
 
-/** /api/hitl/request failed. The request may have landed, so the instance is retired. */
+/**
+ * /api/hitl/request failed. Unless AMP refused it (4xx: nothing was created),
+ * the request may have landed, so the instance is retired.
+ */
 async function requestFailureOutcome(err, instanceId, tool, signal) {
   const em = err && err.message ? err.message : String(err);
   console.error(`[AMP Governance] HITL request failed — blocking tool "${tool}": ${em}`);
   await ampLog(instanceId, `AMP governance check failed — tool "${tool}" blocked: ${em}`, 'ERROR');
+  // LOW2: AMP answered and refused (auth, bad request, rate limit) — not an outage.
+  if (err instanceof AmpRejectedRequestError) {
+    return blockOutcome(`Tool call "${tool}" blocked — AMP rejected the policy check (HTTP ${err.status}).`);
+  }
   if (err instanceof InvalidAmpResponseError) {
     return blockOutcome(`AMP returned an invalid response to the policy check. Tool "${tool}" was blocked as a safety measure.`, true);
   }

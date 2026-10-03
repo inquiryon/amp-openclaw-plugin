@@ -163,10 +163,41 @@ describe('checkToolPolicy — A1/A2 behaviour', () => {
   }
 });
 
+// LOW2: AMP answered the policy check with a 4xx — it is up and refused this
+// request (bad key, bad body, rate limit). Block with the status; it is not an
+// outage (no unreachable state, no outage notification) and no work item was
+// created, so the instance is kept.
+describe('LOW2 — request-side HTTP 4xx is a rejection, not an outage', () => {
+  for (const code of [400, 401, 403, 404, 409, 422, 429]) {
+    test(`request ${code} blocks with the status, no outage, instance kept`, (t) => withPlugin(t, 'allow', async (p) => {
+      await p.handlers.message_received({ from: 'slack:channel:C1' }, { channelId: 'slack' });
+      p.stub.script('POST /api/hitl/request', [{ status: code, body: { error: `stub ${code}` } }, { status: 200, body: { status: 'no-hitl' } }]);
+      const res = await p.callTool('exec', { command: 'echo hi' });
+      assert.equal(res?.block, true);
+      assert.equal(res.blockReason, `Tool call "exec" blocked — AMP rejected the policy check (HTTP ${code}).`);
+      assert.deepEqual(await p.callTool('exec', { command: 'echo again' }), {});
+      await new Promise((r) => setTimeout(r, 100)); // let fire-and-forget notifications settle
+      const notes = p.runtimeCalls.map((c) => String(c.args[1]));
+      assert.deepEqual(notes.filter((m) => /Unreachable|Restored/.test(m)), [], 'no outage / recovery notification');
+      assert.equal(p.stub.count('POST', '/api/agent/init'), 1, 'instance kept');
+      assert.equal(p.stub.count('POST', '/api/agent/setState'), 0);
+    }));
+  }
+
+  test('request 5xx keeps the outage path', (t) => withPlugin(t, 'allow', async (p) => {
+    await p.handlers.message_received({ from: 'slack:channel:C1' }, { channelId: 'slack' });
+    p.stub.script('POST /api/hitl/request', [{ status: 502, body: {} }]);
+    const res = await p.callTool('exec', { command: 'echo hi' });
+    assert.match(res.blockReason, /unreachable/);
+    for (let i = 0; i < 100 && !p.runtimeCalls.length; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.match(String(p.runtimeCalls[0]?.args[1]), /Unreachable/);
+  }));
+});
+
 describe('pollHitlDecision — A4 fail fast on rejected polls', () => {
   const approve = { status: 200, body: { status: 'complete', resolution: 'approve', workitem_id: 'wi-1' } };
 
-  for (const code of [401, 403, 404, 429]) {
+  for (const code of [400, 401, 403, 404, 429]) {
     test(`poll ${code} blocks fast`, (t) => withPlugin(t, 'hitl_approve', async (p) => {
       p.stub.script('GET /api/hitl/get-decision', [{ status: code, body: { error: `stub ${code}` } }]);
       const res = await p.callTool('exec', { command: 'echo hi' });
