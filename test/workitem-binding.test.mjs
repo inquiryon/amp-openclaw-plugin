@@ -229,3 +229,45 @@ describe('C10 — one AMP review at a time per instance', () => {
     assert.equal(res1?.block, true);
   }));
 });
+
+// Backend legacy get-decision path: Adaptive-policy auto decisions and
+// fallbacks come back with workitem_id:'' (read from the progress log, so
+// possibly stale). They cannot be tied to this call — block at once.
+const idless = (extra) => ok({ status: 'complete', workitem_id: '', ...extra });
+
+describe('id-less auto / fallback decisions', () => {
+  test('unbound call blocks an id-less auto approve after exactly 1 poll', (t) => withPlugin(t, async (p) => {
+    p.stub.script('POST /api/hitl/request', [pending(null)]);
+    p.stub.script('GET /api/hitl/get-decision', [idless({ method: 'auto', resolution: 'approve' })]);
+    const res = await exec(p);
+    assert.equal(res?.block, true, `must not allow: ${JSON.stringify(res)}`);
+    assert.equal(res.blockReason,
+      'AMP returned a decision with no work item (method=auto) that cannot be tied to this call — blocked.');
+    assert.equal(p.stub.count(...DECISION), 1);
+  }));
+
+  test('unbound call blocks an id-less fallback after 1 poll and names the safe action', (t) => withPlugin(t, async (p) => {
+    p.stub.script('POST /api/hitl/request', [pending(null)]);
+    p.stub.script('GET /api/hitl/get-decision', [
+      idless({ method: 'fallback', resolution: 'reject', fallback_action: 'notify_admin' }),
+    ]);
+    const res = await exec(p);
+    assert.equal(res?.block, true, `must not allow: ${JSON.stringify(res)}`);
+    assert.equal(res.blockReason,
+      'AMP returned a decision with no work item (method=fallback) that cannot be tied to this call — blocked. Safe action: notify_admin');
+    assert.equal(p.stub.count(...DECISION), 1);
+  }));
+
+  test('bound call keeps polling past an id-less auto body (K2)', (t) => withPlugin(t, async (p) => {
+    p.stub.script('POST /api/hitl/request', [pending('wi-1')]);
+    p.stub.script('GET /api/hitl/get-decision', [
+      idless({ method: 'auto', resolution: 'approve' }),
+      idless({ method: 'fallback', resolution: 'reject' }),
+      done('reject', 'wi-1'),
+    ]);
+    const res = await exec(p);
+    assert.equal(res?.block, true, `must not allow: ${JSON.stringify(res)}`);
+    assert.match(res.blockReason, /rejected by a human reviewer/);
+    assert.equal(p.stub.count(...DECISION), 3);
+  }));
+});

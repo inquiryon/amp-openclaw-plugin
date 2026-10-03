@@ -463,6 +463,9 @@ function rememberWorkitem(seen, workitemId) {
 
 const nonEmptyId = (v) => (typeof v === 'string' && v !== '' ? v : null);
 
+// get-decision `method` values that come without a work item (legacy path).
+const UNVERIFIABLE_METHODS = new Set(['auto', 'fallback']);
+
 /**
  * Pure verdict for one get-decision body. Returns { action, bind?, remember? }
  * where action is 'accept' (terminal, ours), 'ignore' (terminal, not provably
@@ -479,7 +482,22 @@ function classifyDecision(data, bound, seen) {
   const terminal = data.status === 'complete' || isCancelledDecision(data);
   if (!terminal) return !bound && id && !seen.has(id) ? { action: 'wait', bind: id } : { action: 'wait' };
   if (bound) return { action: id === bound ? 'accept' : 'ignore' };
+  if (!id && UNVERIFIABLE_METHODS.has(data.method)) return { action: 'unverifiable' };
   return id ? { action: 'ignore', remember: id } : { action: 'ignore' };
+}
+
+/**
+ * The backend's legacy get-decision path answers an unbound call with an
+ * id-less auto/fallback decision (no work item; read from the instance's
+ * progress log, so possibly stale). It can never be tied to this call, and no
+ * work item will follow — block at once rather than wait out the HITL window.
+ */
+class UnverifiableDecisionError extends Error {
+  constructor(data) {
+    const safe = typeof data.fallback_action === 'string' && data.fallback_action
+      ? ` Safe action: ${data.fallback_action}` : '';
+    super(`AMP returned a decision with no work item (method=${data.method}) that cannot be tied to this call — blocked.${safe}`);
+  }
 }
 
 /** One get-decision round-trip: parsed object body, or null to retry. */
@@ -554,6 +572,7 @@ async function pollHitlDecision(callerId, { signal, boundWorkitemId, actionId, d
     }
     if (verdict.remember) rememberWorkitem(seen, verdict.remember);
     if (verdict.action === 'accept') return data;
+    if (verdict.action === 'unverifiable') throw new UnverifiableDecisionError(data);
     if (verdict.action === 'ignore' && !warnedOther) {
       warnedOther = true;
       const msg = `HITL: ignoring decision for other workitem ${data.workitem_id || '(none)'} — waiting for ${bound || 'own workitem'}`;
@@ -714,6 +733,12 @@ async function requestAndAwaitDecision(instanceId, tool, params, { signal, actio
         await ampLog(instanceId, msg, 'ERROR');
         notifyUser(_lastSender, `AMP could not correlate the review for "${tool}" — the call was blocked.`);
         return { block: true, blockReason: msg };
+      }
+      if (err instanceof UnverifiableDecisionError) {
+        console.error(`[AMP Governance] Tool call "${tool}": ${err.message}`);
+        await ampLog(instanceId, `Tool call "${tool}": ${err.message}`, 'ERROR');
+        notifyUser(_lastSender, `AMP returned a decision for "${tool}" that could not be tied to the call — it was blocked.`);
+        return { block: true, blockReason: err.message };
       }
       if (err instanceof PollFatalError) {
         const msg = `Tool call "${tool}" blocked — AMP rejected the HITL decision poll (HTTP ${err.status}).`;
