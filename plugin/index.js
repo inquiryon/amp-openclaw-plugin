@@ -334,6 +334,9 @@ async function notifyAmpRecovered() {
 
 // ── HITL POLICY ENGINE ───────────────────────────────────────────────────────
 
+// /api/hitl/request answered 2xx with a body that is not JSON.
+class InvalidAmpResponseError extends Error {}
+
 /**
  * Call /api/hitl/request with the tool call details.
  * The AMP backend eval engine decides allow vs HITL.
@@ -360,8 +363,13 @@ async function requestHitlEval(instanceId, tool, params) {
     }),
   });
   if (!res.ok) throw new Error(`/api/hitl/request returned HTTP ${res.status}`);
-  return res.json();
+  try {
+    return await res.json();
+  } catch (err) {
+    throw new InvalidAmpResponseError(`/api/hitl/request returned invalid JSON: ${err?.message || err}`);
+  }
 }
+
 
 /**
  * Poll /api/hitl/get-decision until we get a 'complete' status or time out.
@@ -388,13 +396,9 @@ async function pollHitlDecision(callerId) {
 
 /**
  * Full governance check for a single tool call.
- * Returns normally if the call is allowed (or approved by a human).
- * Throws an Error with a clear reason if the call is blocked or rejected.
- * Fails open (returns without throwing) if AMP backend is unreachable.
- */
-/**
- * Returns {} to allow, or { block: true, blockReason } to block.
- * Never throws — errors fail open so infra issues don't break the agent.
+ * Returns {} to allow, or { block: true, blockReason } to block. Never throws.
+ * Fails closed on unreachable AMP, non-2xx, no_policy, policy_error,
+ * unknown status, and poll timeout.
  */
 async function checkToolPolicy(instanceId, tool, params) {
   const paramSummary = formatInput(tool, params);
@@ -409,13 +413,18 @@ async function checkToolPolicy(instanceId, tool, params) {
     const em = err && err.message ? err.message : String(err);
     console.error(`[AMP Governance] HITL request failed — blocking tool "${tool}": ${em}`);
     await ampLog(instanceId, `AMP governance check failed — tool "${tool}" blocked: ${em}`, 'ERROR');
+    if (err instanceof InvalidAmpResponseError) {
+      return { block: true, blockReason: `AMP returned an invalid response to the policy check. Tool "${tool}" was blocked as a safety measure.` };
+    }
     _ampReachable = false;
     await notifyAmpDown(tool, em);
     return { block: true, blockReason: `AMP Governance service is unreachable. Tool "${tool}" was blocked as a safety measure. Restore the AMP backend and retry.` };
   }
 
-  const status = hitlResponse.status;
-  const rawReason = hitlResponse.reason || hitlResponse.information || '';
+  // Never dereference hitlResponse directly: null / array / scalar bodies fail closed below.
+  const body = hitlResponse && typeof hitlResponse === 'object' && !Array.isArray(hitlResponse) ? hitlResponse : {};
+  const status = typeof body.status === 'string' ? body.status : '';
+  const rawReason = body.reason || body.information || '';
   const reason = typeof rawReason === 'string' ? rawReason : JSON.stringify(rawReason);
   await ampLog(instanceId, `Policy decision: ${tool} | status=${status}${reason ? ` | ${reason}` : ''}`);
 
@@ -426,14 +435,24 @@ async function checkToolPolicy(instanceId, tool, params) {
     return { block: true, blockReason: msg };
   }
 
-  // ── Eval engine approved — allow ─────────────────────────────────────────
-  if (status === 'no-hitl') {
+  // ── Eval engine approved — allow (set mirrors Hermes HP __init__.py:772) ──
+  if (status === 'no-hitl' || status === 'allow' || status === 'allowed' || status === 'approved') {
     console.log(`[AMP Governance] Policy approved: ${tool} (${reason || 'ok'})`);
     return {};
   }
 
+  // ── Policy / config error (HTTP 200 from the backend) — block ────────────
+  if (status === 'policy_error' || status === 'config_error' || status === 'error') {
+    const detail = body.message || reason || 'AMP policy is misconfigured';
+    const msg = `Tool call "${tool}" blocked — AMP policy error (${body.reason || status}): ${detail}`;
+    console.error(`[AMP Governance] ${msg}`);
+    await ampLog(instanceId, msg, 'ERROR');
+    return { block: true, blockReason: msg };
+  }
+
   // ── HITL required — wait for human decision ──────────────────────────────
-  if (status === 'pending' || status === 'waiting-for-response' || hitlResponse.workitem_id) {
+  const hasWorkitem = typeof body.workitem_id === 'string' && body.workitem_id !== '';
+  if (status === 'pending' || status === 'waiting-for-response' || hasWorkitem) {
     console.log(`[AMP Governance] HITL required for "${tool}" — waiting for human decision...`);
     await ampLog(instanceId, `HITL requested for tool: ${tool} — awaiting human approval in AMP`, 'WARN');
 
@@ -473,10 +492,11 @@ async function checkToolPolicy(instanceId, tool, params) {
     return { block: true, blockReason: msg };
   }
 
-  // Unknown response — fail open
-  console.warn('[AMP Governance] Unexpected HITL response:', JSON.stringify(hitlResponse));
-  await ampLog(instanceId, `Unexpected HITL response for ${tool}: ${JSON.stringify(hitlResponse)}`, 'WARN');
-  return {};
+  // ── Unknown response — fail CLOSED ───────────────────────────────────────
+  const msg = `Tool call "${tool}" blocked — AMP returned an unexpected status "${status || 'missing'}".`;
+  console.error('[AMP Governance] Unexpected HITL response:', JSON.stringify(hitlResponse));
+  await ampLog(instanceId, `${msg} Body: ${JSON.stringify(hitlResponse)}`, 'ERROR');
+  return { block: true, blockReason: msg };
 }
 
 // ── TEXT FORMATTING HELPERS ──────────────────────────────────────────────────

@@ -77,23 +77,62 @@ describe('checkToolPolicy — current behaviour', () => {
   }));
 });
 
-describe('checkToolPolicy — A1/A2 target behaviour', () => {
-  test('policy_error 200 blocks and surfaces backend message', { todo: 'A1' }, (t) => withPlugin(t, 'policy_error_200', async (p) => {
+describe('checkToolPolicy — A1/A2 behaviour', () => {
+  test('policy_error 200 blocks and surfaces backend message', (t) => withPlugin(t, 'policy_error_200', async (p) => {
     const res = await p.callTool('exec', { command: 'echo hi' });
     assert.equal(res?.block, true);
     assert.match(res.blockReason, /Missing field\(s\): who/);
     assert.equal(p.stub.count(...DECISION), 0);
   }));
 
-  test('unknown status blocks', { todo: 'A1' }, (t) => withPlugin(t, 'garbage', async (p) => {
+  test('unknown status blocks', (t) => withPlugin(t, 'garbage', async (p) => {
     const res = await p.callTool('exec', { command: 'echo hi' });
     assert.equal(res?.block, true);
     assert.match(res.blockReason, /banana/);
   }));
 
-  test('null / non-object body blocks', { todo: 'A1' }, (t) => withPlugin(t, 'null_body', async (p) => {
+  test('null / non-object body blocks', (t) => withPlugin(t, 'null_body', async (p) => {
     const res = await p.callTool('exec', { command: 'echo hi' });
     assert.equal(res?.block, true);
+  }));
+
+  // Allow set mirrors Hermes (amp-hermes-plugin/plugins/saas/__init__.py:772).
+  for (const status of ['allow', 'allowed', 'approved']) {
+    test(`${status} allows`, (t) => withPlugin(t, 'allow', async (p) => {
+      p.stub.script('POST /api/hitl/request', [{ status: 200, body: { status } }]);
+      const res = await p.callTool('exec', { command: 'echo hi' });
+      assert.deepEqual(res, {});
+      assert.equal(p.stub.count(...DECISION), 0);
+    }));
+  }
+
+  for (const status of ['config_error', 'error']) {
+    test(`${status} blocks`, (t) => withPlugin(t, 'allow', async (p) => {
+      p.stub.script('POST /api/hitl/request', [{
+        status: 200,
+        body: { status, message: `stub ${status} detail`, workitem_id: 'wi-x' },
+      }]);
+      const res = await p.callTool('exec', { command: 'echo hi' });
+      assert.equal(res?.block, true);
+      assert.match(res.blockReason, new RegExp(`stub ${status} detail`));
+      assert.equal(p.stub.count(...DECISION), 0);
+    }));
+  }
+
+  test('array body blocks', (t) => withPlugin(t, 'allow', async (p) => {
+    p.stub.script('POST /api/hitl/request', [{ status: 200, body: [{ status: 'no-hitl' }] }]);
+    const res = await p.callTool('exec', { command: 'echo hi' });
+    assert.equal(res?.block, true);
+    assert.match(res.blockReason, /unexpected status "missing"/);
+    assert.equal(p.stub.count(...DECISION), 0);
+  }));
+
+  test('invalid JSON body blocks', (t) => withPlugin(t, 'allow', async (p) => {
+    p.stub.script('POST /api/hitl/request', [{ status: 200, raw: '{"status":"no-hitl"' }]);
+    const res = await p.callTool('exec', { command: 'echo hi' });
+    assert.equal(res?.block, true);
+    assert.match(res.blockReason, /invalid response/);
+    assert.equal(p.stub.count(...DECISION), 0);
   }));
 
   test('modify resolution blocks (no params applied)', { todo: 'A2' }, (t) => withPlugin(t, 'hitl_modify', async (p) => {
@@ -108,9 +147,9 @@ const MATRIX = [
   { mode: 'allow', expect: 'allow' },
   { mode: 'no_policy', expect: 'block' },
   { mode: 'policy_error', expect: 'block' },
-  { mode: 'policy_error_200', expect: 'block', todo: 'A1' },
-  { mode: 'garbage', expect: 'block', todo: 'A1' },
-  { mode: 'null_body', expect: 'block', todo: 'A1' },
+  { mode: 'policy_error_200', expect: 'block' },
+  { mode: 'garbage', expect: 'block' },
+  { mode: 'null_body', expect: 'block' },
   { mode: 'down', expect: 'block' },
   { mode: 'hitl_approve', expect: 'allow' },
   { mode: 'hitl_reject', expect: 'block' },
