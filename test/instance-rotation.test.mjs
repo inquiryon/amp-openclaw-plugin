@@ -491,3 +491,34 @@ describe('K2.3 — an unprintable throw still blocks and retires', () => {
     assert.equal(a.block, true);
   });
 });
+
+// Wave 3 S08c / K1: production requests are id-less, so the first poll can be a
+// pending body whose work item is already Cancelled before the call is bound.
+// A cancelled outcome can only block, so it ends the call at once (Hermes 248ffe6).
+describe('K1 — a cancelled review ends an unbound call at once', () => {
+  const cancelledPending = (id) => ok({ status: 'pending', workitem_id: id, workitem_status: 'Cancelled' });
+
+  test('first poll pending + workitem_status Cancelled: blocked as cancelled in 1 poll, instance retired', async (t) => {
+    const p = await setup(t);
+    p.stub.script('POST /api/hitl/request', [pending(null), ok({ status: 'no-hitl' })]);
+    p.stub.script('GET /api/hitl/get-decision', [cancelledPending('wi-1')]);
+    const a = await p.callTool('exec', { command: 'one' });
+    assert.equal(a.block, true);
+    assert.match(a.blockReason, /cancelled/);
+    assert.doesNotMatch(a.blockReason, /rejected by|timed out/);
+    assert.equal(p.stub.count('GET', '/api/hitl/get-decision'), 1);
+    assert.deepEqual(await p.callTool('exec', { command: 'two' }), {});
+    assert.deepEqual(requestsOf(p).map((r) => r.body.caller_id), ['inst-1', 'inst-2']);
+  });
+
+  test('a cancelled body for a work item this instance already saw is still ignored', async (t) => {
+    const p = await setup(t);
+    // Call A binds wi-1 and is approved; call B (unbound) then sees wi-1 reported Cancelled -> ignore, wait for its own.
+    p.stub.script('POST /api/hitl/request', [pending(null), pending(null)]);
+    p.stub.script('GET /api/hitl/get-decision', [pending('wi-1'), done('approve', 'wi-1'),
+      cancelledPending('wi-1'), pending('wi-2'), done('reject', 'wi-2')]);
+    assert.deepEqual(await p.callTool('exec', { command: 'one' }), {});
+    const b = await p.callTool('exec', { command: 'two' });
+    assert.match(b.blockReason, /rejected by a human reviewer/);
+  });
+});

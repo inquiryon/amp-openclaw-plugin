@@ -652,6 +652,10 @@ function classifyDecision(data, bound, seen) {
   const terminal = data.status === 'complete' || isCancelledDecision(data);
   if (!terminal) return !bound && id && !seen.has(id) ? { action: 'wait', bind: id } : { action: 'wait' };
   if (bound) return { action: id === bound ? 'accept' : 'ignore' };
+  // K1 (Wave 3 S08c): a cancelled outcome can only block, so an unbound call takes
+  // it as its own at once — unless the id belongs to a work item this instance
+  // already saw (another call's). The cancelled outcome retires the instance.
+  if (isCancelledDecision(data) && !(id && seen.has(id))) return id ? { action: 'accept', bind: id } : { action: 'accept' };
   if (!id && UNVERIFIABLE_METHODS.has(data.method)) return { action: 'unverifiable' };
   return id ? { action: 'ignore', remember: id } : { action: 'ignore' };
 }
@@ -1126,18 +1130,20 @@ async function pollFailureMessage(err, instanceId, tool, signal) {
   return msg;
 }
 
-/** Outcome for the accepted decision of this call's own work item (never retires). */
+/** Outcome for the accepted decision of this call's own work item (retires only on a cancelled review). */
 async function decisionOutcome(decision, instanceId, tool, signal) {
   const wi = decision.workitem_id;
-  const block = async (msg, logMsg, level, note) => {
+  const block = async (msg, logMsg, level, note, retire = false) => {
     if (level === 'ERROR') console.error(`[AMP Governance] ${msg}`);
     await ampLog(instanceId, logMsg, level);
     if (note) notifyUser(_lastSender, note).catch(() => {});
-    return blockOutcome(msg);
+    return blockOutcome(msg, retire);
   };
   if (isCancelledDecision(decision)) {
+    // Retires (K2.3): an unbound call may have taken a cancelled body before its own
+    // work item was bound, so that work item may still be pending on this instance.
     return block(`Tool call "${tool}" blocked — the AMP review was cancelled before a decision was made.`,
-      `HITL cancelled — blocked: ${tool} | workitem: ${wi}`, 'WARN', `The review for "${tool}" was cancelled — the call was blocked.`);
+      `HITL cancelled — blocked: ${tool} | workitem: ${wi}`, 'WARN', `The review for "${tool}" was cancelled — the call was blocked.`, true);
   }
   const resolution = String(decision.resolution || '').toLowerCase().trim();
   console.log(`[AMP Governance] HITL decision for "${tool}": ${resolution}`);
