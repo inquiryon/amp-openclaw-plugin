@@ -298,3 +298,52 @@ describe('K2.3 — a refused or failed policy check that may have reached agent-
     });
   }
 });
+
+// Gate-2 MEDIUM: a throw inside the governance path must never reach the host
+// (older or other hosts may fail open on a throwing hook) and, once the
+// request may have landed, must retire the instance like any other exit
+// without an accepted decision.
+describe('K2.3 — a throw in the governance path retires and blocks', () => {
+  const UNEXPECTED = /AMP governance failed unexpectedly — blocked/;
+  // JSON a helper cannot stringify: String({toString: 1}) throws a TypeError.
+  const unprintable = { toString: 1 };
+
+  test('a decision body that makes a helper throw: blocked, instance retired', async (t) => {
+    const p = await setup(t);
+    p.stub.script('POST /api/hitl/request', [pending('wi-A'), ok({ status: 'no-hitl' })]);
+    scopeDecisions(p, () => ok({ status: 'complete', resolution: unprintable, workitem_id: 'wi-A' }));
+    let a;
+    await assert.doesNotReject(async () => { a = await p.callTool('exec', { command: 'one' }); });
+    assert.equal(a?.block, true);
+    assert.match(a.blockReason, UNEXPECTED);
+    assert.deepEqual(await p.callTool('exec', { command: 'two' }), {});
+    assert.deepEqual(requestsOf(p).map((r) => r.body.caller_id), ['inst-1', 'inst-2']);
+    await waitFor(() => finished(p, 'inst-1').length === 1, 'setState finished for inst-1');
+  });
+
+  test('a request body that makes a helper throw: blocked, instance retired', async (t) => {
+    const p = await setup(t);
+    p.stub.script('POST /api/hitl/request', [ok({ status: 'error', reason: unprintable }), ok({ status: 'no-hitl' })]);
+    let a;
+    await assert.doesNotReject(async () => { a = await p.callTool('exec', { command: 'one' }); });
+    assert.match(a?.blockReason ?? '', UNEXPECTED);
+    assert.deepEqual(await p.callTool('exec', { command: 'two' }), {});
+    assert.deepEqual(requestsOf(p).map((r) => r.body.caller_id), ['inst-1', 'inst-2']);
+  });
+
+  const throwingHosts = [
+    ['event params getter', () => ({ toolName: 'exec', toolCallId: 'tc-x', get params() { throw new Error('host boom'); } }), () => ({})],
+    ['ctx abortSignal getter', () => ({ toolName: 'exec', toolCallId: 'tc-x', params: {} }), () => ({ get abortSignal() { throw new Error('host boom'); } })],
+  ];
+  for (const [name, event, ctx] of throwingHosts) {
+    test(`a throwing host object (${name}) is blocked, never rethrown; the lock is released`, async (t) => {
+      const p = await setup(t);
+      let res;
+      await assert.doesNotReject(async () => { res = await p.handlers.before_tool_call(event(), ctx()); });
+      assert.equal(res?.block, true);
+      assert.match(res.blockReason, UNEXPECTED);
+      assert.equal(p.stub.count('POST', '/api/hitl/request'), 0);
+      assert.deepEqual(await p.callTool('exec', { command: 'next' }), {});
+    });
+  }
+});
