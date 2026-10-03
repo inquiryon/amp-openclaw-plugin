@@ -410,3 +410,41 @@ describe('K2.3 — a cancelled run aborts AMP instance creation', () => {
     assert.deepEqual(notes.filter((m) => /Unreachable|Restored/.test(m)), [], 'no outage / recovery notification');
   });
 });
+
+// Gate-2 LOW6: remaining K2.3 claims, with caller-scoped responses.
+describe('K2.3 — remaining rotation claims', () => {
+  test('init fails after a retire: the call blocks and never reuses the old id', async (t) => {
+    const p = await setup(t);
+    p.stub.script('POST /api/hitl/request', [{ status: 503, body: { error: 'busy' } }, ok({ status: 'no-hitl' })]);
+    p.stub.script('POST /api/agent/init', [ok({ instance_id: 'inst-1', status: 'running' }), { status: 500, body: { error: 'init down' } }]);
+    assert.equal((await p.callTool('exec', { command: 'one' })).block, true);
+    for (const cmd of ['two', 'three']) {
+      const r = await p.callTool('exec', { command: cmd });
+      assert.equal(r?.block, true, `${cmd} must block without an instance: ${JSON.stringify(r)}`);
+      assert.match(r.blockReason, /unreachable/);
+    }
+    assert.deepEqual(requestsOf(p).map((r) => r.body.caller_id), ['inst-1'], 'no request on the retired id');
+    assert.equal(p.stub.count('GET', '/api/hitl/get-decision'), 0);
+    assert.equal(inits(p), 3);
+  });
+
+  test('unexpected status "denied" with a workitem_id: the next call never binds the late work item', async (t) => {
+    const p = await setup(t);
+    p.stub.script('POST /api/hitl/request', [ok({ status: 'denied', workitem_id: 'wi-A' }), pending(null)]);
+    const aEnded = lateWorkitemBackend(p, () => pending(null));
+    assert.match((await p.callTool('exec', { command: 'ls /tmp' })).blockReason, /unexpected status "denied"/);
+    aEnded();
+    await assertCallBSafe(p, p.stub.count('GET', '/api/hitl/get-decision'));
+  });
+
+  test('request cut by the call budget: the next call never binds the late work item', { timeout: 15_000 }, async (t) => {
+    const apiConfig = { plugins: { entries: { 'amp-governance': { hooks: { timeouts: { before_tool_call: 2000 } } } } } };
+    const p = await setup(t, { apiConfig });
+    p.stub.script('POST /api/hitl/request', [{ ...pending(null), delayMs: 10_000 }, pending(null)]);
+    const aEnded = lateWorkitemBackend(p, () => pending(null));
+    assert.match((await p.callTool('exec', { command: 'ls /tmp' })).blockReason, /OpenClaw hook budget/);
+    assert.equal(p.stub.count('GET', '/api/hitl/get-decision'), 0, 'A never got to poll');
+    aEnded();
+    await assertCallBSafe(p, 0);
+  });
+});
