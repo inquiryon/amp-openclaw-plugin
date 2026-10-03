@@ -81,9 +81,8 @@ const PLUGIN_ID = 'amp-governance';
 let _callBudgetMs = HITL_TIMEOUT_MS;
 let _hookBudgetLimitMs = null; // operator before_tool_call timeout, when it binds
 // Deadline of the before_tool_call in progress, so log/init writes made on its
-// behalf never outlive its budget (they are best-effort; a cut write is dropped).
+// behalf are never waited on past its budget (LOW1: late logs are fire-and-forget).
 const _callScope = new AsyncLocalStorage();
-const LOG_MIN_BUDGET_MS = 250;     // a block/audit log still gets this much after the deadline
 const MIN_REQUEST_BUDGET_MS = 500; // below this, /api/hitl/request is not started
 
 /** Block message when the call's own budget ran out. */
@@ -323,7 +322,7 @@ async function ensureInstance() {
       _instanceId = id;
       writeSession(id);
       console.log(`[AMP Governance] AMP instance created: ${id}`);
-      await notifyAmpRecovered();
+      notifyAmpRecovered().catch(() => {}); // OC-4: never holds the call or the lock
     }
     return _instanceId || null;
   } catch (err) {
@@ -342,19 +341,11 @@ async function ensureInstance() {
 
 // ── AMP LOGGING ──────────────────────────────────────────────────────────────
 
-/** Timeout for a log write: the call's remaining budget (floor LOG_MIN_BUDGET_MS), capped at AMP_REQUEST_TIMEOUT_MS. */
-function logSignal() {
-  const deadline = _callScope.getStore()?.deadline;
-  const ms = deadline == null ? AMP_REQUEST_TIMEOUT_MS
-    : Math.min(AMP_REQUEST_TIMEOUT_MS, Math.max(LOG_MIN_BUDGET_MS, deadline - Date.now()));
-  return AbortSignal.timeout(Math.floor(ms));
-}
-
-async function ampLog(instanceId, message, level = 'INFO') {
-  if (!config || !instanceId) return;
+/** One /api/log write, bounded by AMP_REQUEST_TIMEOUT_MS; never rejects. */
+async function postLog(instanceId, message, level) {
   try {
     const apiKey = getAmpApiKey();
-    await fetch(buildAmpUrl('/api/log'), {
+    const res = await fetch(buildAmpUrl('/api/log'), {
       method: 'POST',
       headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -366,11 +357,34 @@ async function ampLog(instanceId, message, level = 'INFO') {
         org_id:      config.AMP_ORG_ID,
         username:    config.AMP_USERNAME,
       }),
-      signal: logSignal(),
+      signal: AbortSignal.timeout(AMP_REQUEST_TIMEOUT_MS),
     });
+    await res.body?.cancel?.();
   } catch (err) {
     console.error('[AMP Governance] ampLog failed:', err?.message || String(err));
   }
+}
+
+/** Resolves when `promise` settles or after `ms`, whichever is first (the promise keeps running). */
+function settleWithin(promise, ms) {
+  let timer;
+  const cut = new Promise((resolve) => { timer = setTimeout(resolve, Math.max(0, ms)); });
+  return Promise.race([promise, cut]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Best-effort AMP log. Inside a before_tool_call the wait never outlives the
+ * call's deadline: before it, the write is awaited for at most the remaining
+ * budget; once it has passed, the write is fired without being awaited (LOW1).
+ * The write itself still completes in the background, bounded by AMP_REQUEST_TIMEOUT_MS.
+ */
+function ampLog(instanceId, message, level = 'INFO') {
+  if (!config || !instanceId) return Promise.resolve();
+  const write = postLog(instanceId, message, level);
+  const deadline = _callScope.getStore()?.deadline;
+  if (deadline == null) return write;
+  const remaining = deadline - Date.now();
+  return remaining > 0 ? settleWithin(write, remaining) : Promise.resolve();
 }
 
 // ── PROACTIVE NOTIFICATIONS ──────────────────────────────────────────────────
@@ -787,7 +801,8 @@ async function noInstanceBlock(tool, instanceId) {
   }
   const reason = 'AMP Governance service is unreachable.';
   console.error(`[AMP Governance] No instance available — blocking tool "${tool}". Reason: ${reason}`);
-  await notifyAmpDown(tool, 'Could not establish an AMP session — backend may be down or unreachable.');
+  // OC-4: fire-and-forget — a hung channel send never holds the call or the lock.
+  notifyAmpDown(tool, 'Could not establish an AMP session — backend may be down or unreachable.').catch(() => {});
   return { block: true, blockReason: reason };
 }
 
@@ -1013,13 +1028,13 @@ async function beforeToolCall(event, ctx, callDeadline) {
   if (!config) {
     const reason = 'AMP Governance plugin is not configured (amp_config.json missing or invalid).';
     console.error(`[AMP Governance] No instance available — blocking tool "${tool}". Reason: ${reason}`);
-    await notifyUser(_lastSender,
+    notifyUser(_lastSender, // OC-4: fire-and-forget
       `🚨 *AMP Governance Not Configured*\n\n` +
       `The AMP Governance plugin has no valid configuration. ` +
       `All OpenClaw activities are blocked until amp_config.json is set up correctly.\n\n` +
       `Please configure AMP_BACKEND_URL, AMP_API_KEY, and AMP_ORG_ID in:\n` +
       CONFIG_FILE
-    );
+    ).catch(() => {});
     return { block: true, blockReason: reason };
   }
   const signal = ctx?.abortSignal;

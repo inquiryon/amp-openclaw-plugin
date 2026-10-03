@@ -28,6 +28,7 @@ function makeFakeRuntime(calls) {
  * @param {string} [options.stateDir]  reuse this OpenClaw state dir (a second "process" on the
  *                                     same state; config rewritten, dir not removed by cleanup)
  * @param {object} [options.config]    overrides merged into amp_config.json
+ * @param {string} [options.configText] raw amp_config.json contents (e.g. invalid JSON)
  * @param {object} [options.runtime]   replaces the fake api.runtime
  * @param {object} [options.stub]      reuse an existing stub (not closed by cleanup)
  * @param {object} [options.apiConfig] OpenClaw config exposed as api.config (operator hook overrides)
@@ -51,7 +52,7 @@ export async function loadPlugin(options = {}) {
     HITL_POLL_INTERVAL_MS: 50,
     ...options.config,
   };
-  fs.writeFileSync(path.join(configDir, 'amp_config.json'), JSON.stringify(config, null, 2));
+  fs.writeFileSync(path.join(configDir, 'amp_config.json'), options.configText ?? JSON.stringify(config, null, 2));
 
   const prevStateDir = process.env.OPENCLAW_STATE_DIR;
   process.env.OPENCLAW_STATE_DIR = stateDir;
