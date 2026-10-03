@@ -291,13 +291,13 @@ async function ampLog(instanceId, message, level = 'INFO') {
  * adapter. Fire-and-forget — errors are logged but never thrown.
  */
 async function notifyUser(sender, message) {
-  if (!sender?.from || !_runtime) return;
-  const prefixed = `[AMP]\n${message}`;
-  const channelId = sender.channelId || (sender.from.startsWith('slack:') ? 'slack' : 'whatsapp');
-  // 'slack:channel:C1' -> 'channel:C1': channel senders expect the bare target.
-  const to = sender.from.startsWith(`${channelId}:`) ? sender.from.slice(channelId.length + 1) : sender.from;
-  console.log(`[AMP Governance] Sending notification to ${sender.from}: ${message}`);
+  if (typeof sender?.from !== 'string' || !sender.from || !_runtime) return;
   try {
+    const prefixed = `[AMP]\n${message}`;
+    const channelId = sender.channelId || (sender.from.startsWith('slack:') ? 'slack' : 'whatsapp');
+    // 'slack:channel:C1' -> 'channel:C1': channel senders expect the bare target.
+    const to = sender.from.startsWith(`${channelId}:`) ? sender.from.slice(channelId.length + 1) : sender.from;
+    console.log(`[AMP Governance] Sending notification to ${sender.from}: ${message}`);
     const outbound = _runtime.channel?.outbound;
     if (typeof outbound?.loadAdapter === 'function') {
       // OpenClaw >= 2026.9 (api.runtime.channel.outbound). sendText argument shape
@@ -913,7 +913,7 @@ export default {
 
     // ── INBOUND MESSAGE: cache sender for HITL/outage notifications ──────────
     api.on('message_received', async (event, ctx) => {
-      if (event.from && ctx.channelId) {
+      if (typeof event?.from === 'string' && event.from && ctx?.channelId) {
         _lastSender = { from: event.from, channelId: ctx.channelId };
         console.log(`[AMP Governance] Sender cached: ${event.from} on ${ctx.channelId}`);
       }

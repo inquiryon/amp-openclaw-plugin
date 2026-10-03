@@ -91,6 +91,20 @@ describe('A7 — notifyUser via runtime outbound adapter', () => {
     });
   });
 
+  test('malformed sender (non-string from) never throws or changes the outcome', (t) => withPlugin(t, { mode: 'hitl_reject' }, async (p) => {
+    const unhandled = [];
+    const onUnhandled = (reason) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    t.after(() => process.off('unhandledRejection', onUnhandled));
+    await p.handlers.message_received({ from: 123 }, { channelId: 'slack' });
+    const res = await p.callTool('exec', { command: 'echo hi' });
+    assert.equal(res?.block, true, JSON.stringify(res));
+    assert.match(res.blockReason, /rejected by a human reviewer/);
+    await new Promise((r) => setTimeout(r, 100)); // let fire-and-forget notifications settle
+    assert.deepEqual(unhandled.map(String), []);
+    assert.deepEqual(p.runtimeCalls, [], 'no notification for a malformed sender');
+  }));
+
   test('rejected call stays blocked when the adapter is missing', (t) => {
     const calls = [];
     return withPlugin(t, { mode: 'hitl_reject', runtime: outboundRuntime(calls, () => null) }, async (p) => {
