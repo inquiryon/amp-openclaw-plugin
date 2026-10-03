@@ -4,7 +4,9 @@
 //
 // Copied from the workspace compat harness (.tools/compat/openclaw); only default paths changed.
 // Usage (driven by test/real-openclaw.test.mjs):
-//   node drive_tool_call.mjs [--modes allow,hitl_approve,...] [--out result.json]
+//   node drive_tool_call.mjs [--modes allow,hitl_approve,...] [--out result.json] [--signal]
+//   --signal: pass a caller-owned AbortSignal to the host gate (becomes ctx.abortSignal) and
+//             record get-decision polls made after the host gate returned (abort probe).
 // Env: OC_PKG (openclaw package dir), OPENCLAW_STATE_DIR, OPENCLAW_CONFIG_PATH,
 //      PLUGIN_DIR (defaults to this repo's plugin/), STUB_URL (default http://127.0.0.1:18999),
 //      STUB_LOG (defaults to <tmpdir>/amp-oc-stub_requests.jsonl, same as stub_amp.py)
@@ -22,6 +24,8 @@ const STUB = process.env.STUB_URL || 'http://127.0.0.1:18999';
 const STUB_LOG = process.env.STUB_LOG || path.join(os.tmpdir(), 'amp-oc-stub_requests.jsonl');
 const MODES = arg('--modes', 'allow,hitl_approve,hitl_reject,no_policy,policy_error,garbage,down,hitl_slow').split(',');
 const OUT = arg('--out', null);
+const WITH_SIGNAL = argv.includes('--signal');
+const SLOW_WAIT_MS = Number(process.env.SLOW_WAIT_MS || 25000);
 const dist = path.join(OC_PKG, 'dist');
 const imp = (p) => import(pathToFileURL(p).href);
 const report = { openclawVersion: JSON.parse(fs.readFileSync(path.join(OC_PKG, 'package.json'))).version, steps: {}, modes: {} };
@@ -41,10 +45,13 @@ async function setMode(mode) {
   return (await r.json()).mode;
 }
 const logOffset = () => (fs.existsSync(STUB_LOG) ? fs.statSync(STUB_LOG).size : 0);
-function stubRequestsSince(off) {
+function stubEntriesSince(off) {
   if (!fs.existsSync(STUB_LOG)) return [];
   const buf = fs.readFileSync(STUB_LOG).subarray(off).toString('utf8');
-  return buf.split('\n').filter(Boolean).map((l) => JSON.parse(l)).map((e) => `${e.method} ${e.path}${e.query && Object.keys(e.query).length ? '?' + new URLSearchParams(e.query) : ''}`);
+  return buf.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+}
+function stubRequestsSince(off) {
+  return stubEntriesSince(off).map((e) => `${e.method} ${e.path}${e.query && Object.keys(e.query).length ? '?' + new URLSearchParams(e.query) : ''}`);
 }
 
 // ── 1. config ────────────────────────────────────────────────────────────────
@@ -106,17 +113,22 @@ for (const mode of MODES) {
 
   // (a) host gate: what the runtime decides
   let off = logOffset(); let t0 = Date.now();
+  const ac = WITH_SIGNAL ? new AbortController() : null;
   try {
     const out = runBeforeToolCallHook
-      ? await runBeforeToolCallHook({ toolName: 'exec', params, toolCallId: `tc-${++n}`, ctx })
+      ? await runBeforeToolCallHook({ toolName: 'exec', params, toolCallId: `tc-${++n}`, ctx, ...(ac ? { signal: ac.signal } : {}) })
       : { note: 'runBeforeToolCallHook not found' };
     r.hostGate = { blocked: out.blocked, kind: out.kind, deniedReason: out.deniedReason, reason: out.reason };
   } catch (e) { r.hostGate = { threw: String(e) }; }
   r.hostGateMs = Date.now() - t0;
+  r.hostGateEndTs = Date.now() / 1000;
+  r.hostGateLogOffset = logOffset();
+  r.callerSignalAborted = ac ? ac.signal.aborted : null;
   r.stubDuringHostGate = stubRequestsSince(off);
 
   // (b) wrapped tool: does the fake exec tool actually execute?
-  if (wrapTool) {
+  // The abort probe measures only the host-gate call; extra calls would add their own polls.
+  if (wrapTool && !WITH_SIGNAL) {
     let executed = false;
     const fakeExec = { name: 'exec', label: 'exec', description: 'fake exec', parameters: { type: 'object', properties: { command: { type: 'string' } } },
       execute: async () => { executed = true; return { content: [{ type: 'text', text: 'hi' }] }; } };
@@ -131,7 +143,7 @@ for (const mode of MODES) {
   }
 
   // (c) raw plugin return value (no host timeout). Skip for slow mode.
-  if (rawHandler && mode !== 'hitl_slow') {
+  if (rawHandler && mode !== 'hitl_slow' && !WITH_SIGNAL) {
     t0 = Date.now();
     try { r.pluginReturn = await rawHandler({ toolName: 'exec', params }, ctx); } catch (e) { r.pluginReturn = { threw: String(e) }; }
     r.pluginReturnMs = Date.now() - t0;
@@ -141,8 +153,13 @@ for (const mode of MODES) {
 }
 if (MODES.includes('hitl_slow')) {
   // let the orphaned (timed-out) plugin promise finish so we can see what it would have returned
-  await new Promise((res) => setTimeout(res, 25000));
-  report.modes.hitl_slow.stubAfterWait = stubRequestsSince(0).slice(-6);
+  await new Promise((res) => setTimeout(res, SLOW_WAIT_MS));
+  const slow = report.modes.hitl_slow;
+  slow.stubAfterWait = stubRequestsSince(0).slice(-6);
+  // Polls the plugin made after the host gate had already returned: >0 after a host
+  // timeout means the hook's ctx.abortSignal was NOT aborted by the timeout.
+  slow.pollsAfterHostGate = stubEntriesSince(slow.hostGateLogOffset)
+    .filter((e) => e.path === '/api/hitl/get-decision' && e.ts >= slow.hostGateEndTs).length;
 }
 await setMode('allow');
 const json = JSON.stringify(report, null, 2);
