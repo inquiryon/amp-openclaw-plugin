@@ -160,3 +160,72 @@ describe('K2 — bind each call to its own work item', () => {
     assert.match(blocked[0].blockReason, /timed out/);
   }));
 });
+
+/** Poll (no fixed sleep) until pred() is truthy; fails after maxPolls checks. */
+async function waitFor(pred, what, maxPolls = 500) {
+  for (let i = 0; i < maxPolls; i++) {
+    if (pred()) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.fail(`timed out waiting for ${what}`);
+}
+
+/** Index in the stub log of every request matching method + path. */
+const indexesOf = (p, method, urlPath) => p.stub.requests()
+  .map((r, i) => (r.method === method && r.path === urlPath ? i : -1))
+  .filter((i) => i >= 0);
+
+const policyChecks = (p) => p.stub.requests((r) => r.path === '/api/log'
+  && /^Policy check:/.test(r.body?.message || '')).length;
+
+describe('C10 — one AMP review at a time per instance', () => {
+  test('two concurrent unbound calls are serialized and cannot cross-bind', (t) => withPlugin(t, async (p) => {
+    await approvedFirstCall(p); // warm the instance so both calls share it
+    const base = p.stub.requests().length;
+    p.stub.script('POST /api/hitl/request', [pending(null)]);
+    p.stub.script('GET /api/hitl/get-decision', [pending('wi-X'), done('approve', 'wi-X')]);
+    const results = await Promise.all([exec(p), exec(p)]);
+    const allowed = results.filter((r) => r && Object.keys(r).length === 0);
+    assert.ok(allowed.length <= 1, `at most one call may run: ${JSON.stringify(results)}`);
+    const reqs = indexesOf(p, 'POST', '/api/hitl/request').filter((i) => i >= base);
+    const polls = indexesOf(p, ...DECISION).filter((i) => i >= base);
+    assert.equal(reqs.length, 2);
+    const approveIdx = polls[1]; // second poll of the run answered approve wi-X
+    assert.ok(reqs[1] > approveIdx,
+      `second /api/hitl/request (#${reqs[1]}) must follow the first call's decision poll (#${approveIdx})`);
+  }));
+
+  test('a no-hitl call behind a pending review completes after it', (t) => withPlugin(t, async (p) => {
+    p.stub.script('POST /api/hitl/request', [pending('wi-1'), ok({ status: 'no-hitl' })]);
+    p.stub.script('GET /api/hitl/get-decision', [pending('wi-1'), pending('wi-1'), done('approve', 'wi-1')]);
+    const first = exec(p);
+    await waitFor(() => p.stub.count('POST', '/api/hitl/request') >= 1, 'first request');
+    const second = exec(p);
+    assert.deepEqual(await first, {});
+    assert.deepEqual(await second, {});
+    const reqs = indexesOf(p, 'POST', '/api/hitl/request');
+    const polls = indexesOf(p, ...DECISION);
+    assert.equal(reqs.length, 2);
+    assert.equal(polls.length, 3);
+    assert.ok(reqs[1] > polls[2], 'no-hitl request must wait for the pending review to finish');
+  }));
+
+  test('a call aborted while waiting for the instance blocks without a request', (t) => withPlugin(t, async (p) => {
+    p.stub.script('POST /api/hitl/request', [pending('wi-1'), pending(null)]);
+    p.stub.script('GET /api/hitl/get-decision', [pending('wi-1')]);
+    const ac1 = new AbortController();
+    const ac2 = new AbortController();
+    const first = p.callTool('exec', { command: 'echo 1' }, { abortSignal: ac1.signal });
+    await waitFor(() => p.stub.count(...DECISION) >= 1, 'first call polling');
+    const second = p.callTool('exec', { command: 'echo 2' }, { abortSignal: ac2.signal });
+    await waitFor(() => policyChecks(p) >= 2, 'second call policy check');
+    ac2.abort();
+    const res2 = await second;
+    assert.equal(res2?.block, true, JSON.stringify(res2));
+    assert.match(res2.blockReason, /another AMP review is in progress for this agent instance/);
+    assert.equal(p.stub.count('POST', '/api/hitl/request'), 1, 'aborted waiter must not send a request');
+    ac1.abort();
+    const res1 = await first;
+    assert.equal(res1?.block, true);
+  }));
+});

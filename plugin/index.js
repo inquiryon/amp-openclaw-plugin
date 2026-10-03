@@ -527,19 +527,20 @@ function checkActionIdWatchdog(actionId, bound, started) {
 
 /**
  * Poll /api/hitl/get-decision until this call's work item is complete (or
- * cancelled) or the HITL window ends. Binds to `boundWorkitemId`, else to the
+ * cancelled) or the call's deadline passes. Binds to `boundWorkitemId`, else to the
  * first unseen workitem_id in a pending body (see classifyDecision).
  * Throws PollFatalError on HTTP 401/403/404/429; other failures keep polling.
  * Rejects as soon as `signal` aborts (run cancelled). A bound id stays in the
  * instance set on every exit, so an abandoned work item is never accepted later.
  */
-async function pollHitlDecision(callerId, { signal, boundWorkitemId, actionId } = {}) {
+async function pollHitlDecision(callerId, { signal, boundWorkitemId, actionId, deadline: callDeadline } = {}) {
   const apiKey = getAmpApiKey();
   const seen = seenWorkitemsFor(callerId);
   let bound = nonEmptyId(boundWorkitemId);
   let warnedOther = false;
   const started = Date.now();
-  const deadline = started + HITL_TIMEOUT_MS;
+  // C10: the call's budget includes any wait for the instance lock.
+  const deadline = callDeadline ?? started + HITL_TIMEOUT_MS;
   while (Date.now() < deadline) {
     await sleep(HITL_POLL_INTERVAL_MS, signal);
     const data = await fetchDecisionBody(apiKey, callerId, actionId, signal);
@@ -566,16 +567,73 @@ async function pollHitlDecision(callerId, { signal, boundWorkitemId, actionId } 
   throw new Error(`HITL decision timed out after ${HITL_TIMEOUT_MS / 60000} minutes`);
 }
 
+// ── PER-INSTANCE REVIEW LOCK (C10) ──────────────────────────────────────────
+// get-decision is instance-scoped, so two calls waiting on the same instance
+// could bind each other's work item. Only one governance request/review is in
+// flight per instance in this process ("one approval at a time").
+const _instanceLocks = new Map(); // instanceId -> tail of the promise chain
+
+/** Resolves true once `prev` settles in time; false at `deadline` or on abort. */
+function waitForTurn(prev, deadline, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve(false);
+    let timer;
+    const finish = (ok) => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      resolve(ok);
+    };
+    const onAbort = () => finish(false);
+    timer = setTimeout(() => finish(false), Math.max(0, deadline - Date.now()));
+    signal?.addEventListener('abort', onAbort, { once: true });
+    prev.then(() => finish(Date.now() < deadline && !signal?.aborted));
+  });
+}
+
+/** Queues for the instance lock; returns a release function, or null (blocked). */
+async function acquireInstanceLock(instanceId, deadline, signal) {
+  const prev = _instanceLocks.get(instanceId) ?? Promise.resolve();
+  let release;
+  const mine = new Promise((resolve) => { release = resolve; });
+  const tail = prev.then(() => mine);
+  _instanceLocks.set(instanceId, tail);
+  tail.then(() => {
+    if (_instanceLocks.get(instanceId) === tail) _instanceLocks.delete(instanceId);
+  });
+  if (await waitForTurn(prev, deadline, signal)) return release;
+  release(); // give up our slot; later waiters still wait for `prev`
+  return null;
+}
+
 /**
  * Full governance check for a single tool call.
  * Returns {} to allow, or { block: true, blockReason } to block. Never throws.
  * Fails closed on unreachable AMP, non-2xx, no_policy, policy_error,
- * unknown status, and poll timeout.
+ * unknown status, poll timeout, and a lock wait past the call's deadline.
  */
-async function checkToolPolicy(instanceId, tool, params, { signal, actionId } = {}) {
+async function checkToolPolicy(instanceId, tool, params, { signal, actionId, deadline } = {}) {
+  const callDeadline = deadline ?? Date.now() + HITL_TIMEOUT_MS;
   const paramSummary = formatInput(tool, params);
   await ampLog(instanceId, `Policy check: ${tool} | ${paramSummary}`);
 
+  const contended = _instanceLocks.has(instanceId);
+  const release = await acquireInstanceLock(instanceId, callDeadline, signal);
+  if (!release) {
+    const why = contended ? 'another AMP review is in progress for this agent instance' : 'the call could not start its AMP review in time';
+    const msg = `Tool call "${tool}" blocked — ${why}${signal?.aborted ? ' (run cancelled while waiting)' : ''}.`;
+    console.warn(`[AMP Governance] ${msg}`);
+    await ampLog(instanceId, msg, 'WARN');
+    return { block: true, blockReason: msg };
+  }
+  try {
+    return await requestAndAwaitDecision(instanceId, tool, params, { signal, actionId, deadline: callDeadline });
+  } finally {
+    release();
+  }
+}
+
+/** Request + HITL wait for one call; runs while holding the instance lock. */
+async function requestAndAwaitDecision(instanceId, tool, params, { signal, actionId, deadline }) {
   let hitlResponse;
   try {
     hitlResponse = await requestHitlEval(instanceId, tool, params, actionId);
@@ -638,7 +696,7 @@ async function checkToolPolicy(instanceId, tool, params, { signal, actionId } = 
 
     let decision;
     try {
-      decision = await pollHitlDecision(instanceId, { signal, boundWorkitemId, actionId });
+      decision = await pollHitlDecision(instanceId, { signal, boundWorkitemId, actionId, deadline });
     } catch (err) {
       if (signal?.aborted) {
         const msg = `Tool call "${tool}" blocked — run cancelled while waiting for AMP review.`;
@@ -863,6 +921,8 @@ export default {
 
     // ── BEFORE TOOL CALL: governance check + logging ─────────────────────────
     api.on('before_tool_call', async (event, ctx) => {
+      // C10: one budget per call, shared by the lock wait and the HITL poll.
+      const callDeadline = Date.now() + HITL_TIMEOUT_MS;
       const tool = event.toolName || event.name || 'unknown-tool';
       if (SKIP_TOOLS.has(tool)) return {};
 
@@ -893,7 +953,7 @@ export default {
 
       // Governance check — returns {} to allow or { block, blockReason } to block
       const actionId = ACTION_ID_CORRELATION ? (event.toolCallId || randomUUID()) : null;
-      return await checkToolPolicy(instanceId, tool, event.params, { signal: ctx?.abortSignal, actionId });
+      return await checkToolPolicy(instanceId, tool, event.params, { signal: ctx?.abortSignal, actionId, deadline: callDeadline });
     }, { timeoutMs: HOOK_TIMEOUT_MS });
 
     // ── AFTER TOOL CALL: result logging ──────────────────────────────────────
