@@ -253,3 +253,48 @@ describe('K2.3 — one process-wide governance lock', () => {
     assert.equal(inits(p), 1);
   });
 });
+
+// Gate-2 HIGH: the backend proxies agent-hitl's status + body unchanged
+// (inquiryon_amp_backend app.py:10000-10019), so a 4xx or an error body may
+// come from agent-hitl after it created a work item. Only early returns the
+// backend itself makes before proxying (recognised by body shape) keep the instance.
+describe('K2.3 — a refused or failed policy check that may have reached agent-hitl retires the instance', () => {
+  const mayHaveLanded = [
+    ['HTTP 409 from agent-hitl', { status: 409, body: { error: 'agent-hitl conflict' } }],
+    ['HTTP 400 non-JSON body', { status: 400, raw: '<html>bad request</html>' }],
+    ['HTTP 422 without an error field', { status: 422, body: { message: 'unprocessable' } }],
+    ['200 status error', ok({ status: 'error', message: 'notify failed' })],
+    ['200 status config_error', ok({ status: 'config_error', message: 'bad config' })],
+    ['200 policy_error with another reason', ok({ status: 'policy_error', reason: 'evaluator_crashed' })],
+  ];
+  for (const [name, first] of mayHaveLanded) {
+    test(`${name}: the next call never binds the late work item`, async (t) => {
+      const p = await setup(t);
+      p.stub.script('POST /api/hitl/request', [first, pending(null)]);
+      const aEnded = lateWorkitemBackend(p, () => pending(null));
+      assert.equal((await p.callTool('exec', { command: 'ls /tmp' })).block, true);
+      aEnded();
+      await assertCallBSafe(p, p.stub.count('GET', '/api/hitl/get-decision'));
+    });
+  }
+
+  const backendNative = [
+    ['call_limit_reached', { status: 429, body: { error: 'call_limit_reached', used: 5, limit: 5 } }],
+    ['authentication_required', { status: 401, body: { error: 'authentication_required' } }],
+    ['instance_not_owned', { status: 403, body: { error: 'instance_not_owned' } }],
+    ['invalid_caller_id', { status: 400, body: { error: 'invalid_caller_id' } }],
+    ['org_id_required', { status: 400, body: { error: 'org_id_required' } }],
+    ['callback_url_required', { status: 400, body: { error: 'callback_url_required' } }],
+    ['policy_error policy_invalid_hitl_assignee', ok({ status: 'policy_error', reason: 'policy_invalid_hitl_assignee', message: 'bad who' })],
+  ];
+  for (const [name, first] of backendNative) {
+    test(`backend-native refusal ${name}: no work item can exist, the instance is kept`, async (t) => {
+      const p = await setup(t);
+      p.stub.script('POST /api/hitl/request', [first, ok({ status: 'no-hitl' })]);
+      assert.equal((await p.callTool('exec', { command: 'one' })).block, true);
+      assert.deepEqual(await p.callTool('exec', { command: 'two' }), {});
+      assert.deepEqual(requestsOf(p).map((r) => r.body.caller_id), ['inst-1', 'inst-1']);
+      assert.equal(p.stub.count('POST', '/api/agent/setState'), 0);
+    });
+  }
+});

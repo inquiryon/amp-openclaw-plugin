@@ -480,10 +480,23 @@ async function notifyAmpRecovered() {
 class InvalidAmpResponseError extends Error {}
 
 // /api/hitl/request answered HTTP 4xx: AMP is up and refused the request (LOW2).
+// `error` is the JSON body's string `error` field, or null.
 class AmpRejectedRequestError extends Error {
-  constructor(status) {
-    super(`/api/hitl/request returned HTTP ${status}`);
+  constructor(status, error) {
+    super(`/api/hitl/request returned HTTP ${status}${error ? ` (${error})` : ''}`);
     this.status = status;
+    this.error = error;
+  }
+}
+
+/** The string `error` field of a 4xx body, or null (non-JSON / no such field). */
+async function rejectionErrorCode(res) {
+  const text = await res.text().catch(() => '');
+  try {
+    const data = JSON.parse(text);
+    return typeof data?.error === 'string' ? data.error : null;
+  } catch {
+    return null;
   }
 }
 
@@ -515,8 +528,7 @@ async function requestHitlEval(instanceId, tool, params, actionId, { signal, dea
     signal: requestSignal(signal, deadline),
   });
   if (res.status >= 400 && res.status < 500) {
-    await res.body?.cancel?.();
-    throw new AmpRejectedRequestError(res.status);
+    throw new AmpRejectedRequestError(res.status, await rejectionErrorCode(res));
   }
   if (!res.ok) throw new Error(`/api/hitl/request returned HTTP ${res.status}`);
   try {
@@ -871,9 +883,28 @@ async function requestAndAwaitDecision(instanceId, tool, params, { signal, actio
   return requestResponseOutcome(hitlResponse, instanceId, tool, { signal, actionId, deadline });
 }
 
+// ── BACKEND-NATIVE REFUSALS (K2.3) ──────────────────────────────────────────
+// The backend proxies agent-hitl's HTTP status and body unchanged
+// (inquiryon_amp_backend app.py:10000-10019), so a 4xx or an error body may
+// come from agent-hitl after it created a work item. Only the backend's own
+// early returns, made before the proxy, prove that no work item exists; they
+// are recognised by body shape. Every other refusal or failure retires.
+// 4xx `error` values the backend returns before proxying (app.py ~9693-9840).
+const BACKEND_NATIVE_4XX_ERRORS = new Set([
+  'call_limit_reached', 'authentication_required', 'instance_not_owned',
+  'invalid_caller_id', 'org_id_required', 'callback_url_required',
+]);
+// 200 policy_error reasons the backend returns before proxying (app.py:9524-9545).
+const BACKEND_NATIVE_POLICY_ERROR_REASONS = new Set(['policy_missing_hitl_routing', 'policy_invalid_hitl_assignee']);
+
+/** True when a 200 policy-error body is a backend-native early return (no work item). */
+const isBackendNativePolicyError = (body) =>
+  body.status === 'policy_error' && BACKEND_NATIVE_POLICY_ERROR_REASONS.has(body.reason);
+
 /**
- * /api/hitl/request failed. Unless AMP refused it (4xx: nothing was created),
- * the request may have landed, so the instance is retired.
+ * /api/hitl/request failed. Unless the backend itself refused it before
+ * proxying (a backend-native 4xx), the request may have landed, so the
+ * instance is retired.
  */
 async function requestFailureOutcome(err, instanceId, tool, signal) {
   const em = err && err.message ? err.message : String(err);
@@ -881,7 +912,8 @@ async function requestFailureOutcome(err, instanceId, tool, signal) {
   await ampLog(instanceId, `AMP governance check failed — tool "${tool}" blocked: ${em}`, 'ERROR');
   // LOW2: AMP answered and refused (auth, bad request, rate limit) — not an outage.
   if (err instanceof AmpRejectedRequestError) {
-    return blockOutcome(`Tool call "${tool}" blocked — AMP rejected the policy check (HTTP ${err.status}).`);
+    return blockOutcome(`Tool call "${tool}" blocked — AMP rejected the policy check (HTTP ${err.status}).`,
+      !BACKEND_NATIVE_4XX_ERRORS.has(err.error));
   }
   if (err instanceof InvalidAmpResponseError) {
     return blockOutcome(`AMP returned an invalid response to the policy check. Tool "${tool}" was blocked as a safety measure.`, true);
@@ -931,7 +963,7 @@ async function requestResponseOutcome(hitlResponse, instanceId, tool, opts) {
     const msg = `Tool call "${tool}" blocked — AMP policy error (${body.reason || status}): ${body.message || reason || 'AMP policy is misconfigured'}`;
     console.error(`[AMP Governance] ${msg}`);
     await ampLog(instanceId, msg, 'ERROR');
-    return blockOutcome(msg);
+    return blockOutcome(msg, !isBackendNativePolicyError(body));
   }
   // OC-5: only a pending status starts a review wait; a workitem_id alone never does.
   if (status === 'pending' || status === 'waiting-for-response') {

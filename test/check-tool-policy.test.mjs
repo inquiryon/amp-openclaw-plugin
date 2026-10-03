@@ -165,11 +165,12 @@ describe('checkToolPolicy — A1/A2 behaviour', () => {
 
 // LOW2: AMP answered the policy check with a 4xx — it is up and refused this
 // request (bad key, bad body, rate limit). Block with the status; it is not an
-// outage (no unreachable state, no outage notification) and no work item was
-// created, so the instance is kept.
+// outage (no unreachable state, no outage notification). The body is not a
+// backend-native refusal, so agent-hitl may have created a work item: the
+// instance is retired (K2.3; native refusals: instance-rotation.test.mjs).
 describe('LOW2 — request-side HTTP 4xx is a rejection, not an outage', () => {
   for (const code of [400, 401, 403, 404, 409, 422, 429]) {
-    test(`request ${code} blocks with the status, no outage, instance kept`, (t) => withPlugin(t, 'allow', async (p) => {
+    test(`request ${code} blocks with the status, no outage, instance retired`, (t) => withPlugin(t, 'allow', async (p) => {
       await p.handlers.message_received({ from: 'slack:channel:C1' }, { channelId: 'slack' });
       p.stub.script('POST /api/hitl/request', [{ status: code, body: { error: `stub ${code}` } }, { status: 200, body: { status: 'no-hitl' } }]);
       const res = await p.callTool('exec', { command: 'echo hi' });
@@ -179,8 +180,8 @@ describe('LOW2 — request-side HTTP 4xx is a rejection, not an outage', () => {
       await new Promise((r) => setTimeout(r, 100)); // let fire-and-forget notifications settle
       const notes = p.runtimeCalls.map((c) => String(c.args[1]));
       assert.deepEqual(notes.filter((m) => /Unreachable|Restored/.test(m)), [], 'no outage / recovery notification');
-      assert.equal(p.stub.count('POST', '/api/agent/init'), 1, 'instance kept');
-      assert.equal(p.stub.count('POST', '/api/agent/setState'), 0);
+      assert.equal(p.stub.count('POST', '/api/agent/init'), 2, 'instance retired');
+      assert.equal(p.stub.count('POST', '/api/agent/setState'), 1);
     }));
   }
 
