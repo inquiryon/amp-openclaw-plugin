@@ -25,8 +25,8 @@ const STUB_LOG = process.env.STUB_LOG || path.join(os.tmpdir(), 'amp-oc-stub_req
 const MODES = arg('--modes', 'allow,hitl_approve,hitl_reject,no_policy,policy_error,garbage,down,hitl_slow').split(',');
 const OUT = arg('--out', null);
 const WITH_SIGNAL = argv.includes('--signal');
-// --abort-after-gate (with --signal): abort the caller signal as soon as the host gate returns.
-const ABORT_AFTER_GATE = WITH_SIGNAL && argv.includes('--abort-after-gate');
+// --abort-after-ms N (with --signal): abort the caller signal N ms into the host-gate call.
+const ABORT_AFTER_MS = WITH_SIGNAL && argv.includes('--abort-after-ms') ? Number(arg('--abort-after-ms')) : null;
 const SLOW_WAIT_MS = Number(process.env.SLOW_WAIT_MS || 25000);
 const dist = path.join(OC_PKG, 'dist');
 const imp = (p) => import(pathToFileURL(p).href);
@@ -116,6 +116,7 @@ for (const mode of MODES) {
   // (a) host gate: what the runtime decides
   let off = logOffset(); let t0 = Date.now();
   const ac = WITH_SIGNAL ? new AbortController() : null;
+  const abortTimer = ac && ABORT_AFTER_MS !== null ? setTimeout(() => { ac.abort(); r.abortedAtMs = Date.now() - t0; }, ABORT_AFTER_MS) : null;
   try {
     const out = runBeforeToolCallHook
       ? await runBeforeToolCallHook({ toolName: 'exec', params, toolCallId: `tc-${++n}`, ctx, ...(ac ? { signal: ac.signal } : {}) })
@@ -125,8 +126,8 @@ for (const mode of MODES) {
   r.hostGateMs = Date.now() - t0;
   r.hostGateEndTs = Date.now() / 1000;
   r.hostGateLogOffset = logOffset();
+  if (abortTimer) clearTimeout(abortTimer);
   r.callerSignalAborted = ac ? ac.signal.aborted : null;
-  if (ac && ABORT_AFTER_GATE) { ac.abort(); r.abortedAfterGate = true; }
   r.stubDuringHostGate = stubRequestsSince(off);
 
   // (b) wrapped tool: does the fake exec tool actually execute?
