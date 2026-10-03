@@ -143,7 +143,7 @@ The sections below document the technical implementation of the AOC plugin — f
 
 ## Configuration
 
-`~/.openclaw/hooks/amp/amp_config.json` fields:
+`$OPENCLAW_STATE_DIR/hooks/amp/amp_config.json` (default `~/.openclaw/hooks/amp/amp_config.json`) fields:
 
 | Field | Purpose | Default |
 |---|---|---|
@@ -153,16 +153,22 @@ The sections below document the technical implementation of the AOC plugin — f
 | `AGENT_NAME` | The agent name you chose at registration | — |
 | `AMP_USERNAME` | Your AMP login email | — |
 | `HITL_TIMEOUT_MINUTES` | How long the agent waits for a human decision before blocking the tool call | `10` |
+| `HITL_POLL_INTERVAL_MS` | Milliseconds between `/api/hitl/get-decision` polls | `3000` |
+| `AMP_REQUEST_TIMEOUT_MS` | Per-request timeout for every AMP HTTP call (also capped by the call's remaining HITL window) | `15000` |
+| `ACTION_ID_CORRELATION` | Send a per-tool-call `action_id` on `/api/hitl/request` and `/api/hitl/get-decision`, and only accept decisions that echo it. Turn on only once your AMP HITL service stores `action_id`; must be JSON `true` | `false` |
+| `ACTION_ID_WATCHDOG_SECONDS` | With `ACTION_ID_CORRELATION` on: block if AMP has not created a work item for the action within this many seconds | `60` |
 
 ## Notification Bridge
 
 When AMP requires HITL, or when the reviewer's decision resolves, the plugin sends a message back to the originating channel.
 
-**Supported platforms:** WhatsApp and Slack — resolved from the sender's channel at message time (`notifyUser()` in `plugin/index.js` routes to `sendMessageSlack()` for Slack senders, `sendMessageWhatsApp()` otherwise).
+**Supported platforms:** WhatsApp and Slack — resolved from the sender's channel at message time (`notifyUser()` in `plugin/index.js` uses the runtime outbound adapter (`api.runtime.channel.outbound`) on OpenClaw ≥ 2026.9, and the legacy `sendMessageSlack()` / `sendMessageWhatsApp()` on older hosts). The outbound-adapter path has not yet been verified against a live gateway.
 
 **Notification events:**
 - Action paused, awaiting human review
-- Review approved (or approved with modifications)
+- Review approved
+- Review modified (the original call is blocked — the modified version is not applied automatically yet; re-submit with the reviewer's changes)
+- Review cancelled (the work item was cancelled before a decision; the call is blocked)
 - Review rejected
 - Review timed out and action blocked
 - AMP backend unreachable / recovered (see [AMP Outage Detection](#amp-outage-detection))
@@ -216,6 +222,16 @@ AOC has no Hermes equivalent for this: it fails closed with clear user-facing no
 - **Fail-closed:** while AMP is unreachable, every tool call is blocked as a safety measure — consistent with tool-call governance's normal fail-closed default (this is the opposite of Hermes's LLM-governance fail-open default, which exists specifically because blocking every LLM call on an outage would halt the agent entirely).
 - **Coverage note:** because detection is now tied to real governance calls, an outage during a purely conversational exchange that never triggers a tool call won't be detected until the next tool call is attempted. This trade-off was made deliberately — see [Troubleshooting](#troubleshooting) if you're debugging a suspected outage that isn't producing a notification.
 
+### Fail-closed statuses
+
+Besides outages, the plugin blocks a tool call when AMP returns `no_policy`, `policy_error` / `config_error` / `error` (for example a policy with no complete HITL routing or an invalid reviewer — the block reason carries AMP's message), a body that is not a JSON object, or any status it does not recognise. Only `no-hitl`, `allow`, `allowed` and `approved` allow a call without review (the same set as the Hermes plugin).
+
+While waiting for a review it also blocks when: the decision poll is rejected with HTTP 401/403/404/429 (immediately, with the status in the reason); the reviewer modifies or rejects the call; the work item is cancelled; the OpenClaw run is cancelled; or `HITL_TIMEOUT_MINUTES` passes. Other poll errors (e.g. HTTP 500) are retried until the timeout.
+
+Each call only accepts a decision for its own work item: the plugin binds the call to the first new `workitem_id` AMP reports for it (in the `/api/hitl/request` response or a *pending* decision poll) and ignores every other decision for the same AMP instance — for example an earlier call's approval, or the last decision of an instance restored after a gateway restart. A decision that arrives before the call has seen its work item pending is not accepted; the call keeps waiting and blocks at the timeout. Consequence: AMP decisions that carry no work item (Adaptive Policy auto decisions with "workitem not created", and authority safe-action fallbacks) cannot be tied to the call and block it immediately.
+
+Reviews are serialized per AMP instance: while one tool call is waiting for a review, later governed calls of the same instance wait for it to finish — the wait counts against the queued call's own `HITL_TIMEOUT_MINUTES` window, so a call queued behind a long review has less time for its own and blocks when the window runs out. This prevents two waiting calls from consuming each other's decision. Every AMP request is also capped at `AMP_REQUEST_TIMEOUT_MS` (default 15000) and the call's remaining window.
+
 ## Session Lifecycle
 
 "Session" state lives in three separate, non-overlapping places. This matters because clearing one does not clear the others — worth understanding distinctly rather than assuming a single "reset" covers everything.
@@ -225,11 +241,11 @@ AOC has no Hermes equivalent for this: it fails closed with clear user-facing no
 **2. `hook/handler.ts`'s conversation-keyed AMP instance map** — an in-memory map from conversation key (`channel:conversationId`) to AMP instance ID, driving the hook's own init/finalize lifecycle:
 - **Conversation-keyed instances:** each WhatsApp/Slack conversation maps to its own AMP instance, keyed by `channel:conversationId` (`conversationKey()`). The first inbound message in a conversation calls `/api/agent/init`; subsequent messages reuse the same instance.
 - **30-call rollover:** after 30 tool calls in one conversation, the current instance is finalized (`setState: finished`) and a new one is started automatically — keeps very long-running conversations from accumulating into a single unbounded AMP instance.
-- **Orphan cleanup on restart:** on process startup, `startupCleanup()` checks for an instance left active by a previous process (e.g. after a crash or deploy) and finalizes it before continuing.
+- **Orphan cleanup on restart:** on process startup, `startupCleanup()` checks `$OPENCLAW_STATE_DIR/hooks/amp/hook-session.json` for an instance the hook left active in a previous process (e.g. after a crash or deploy) and finalizes it before continuing. It only finalizes records the hook wrote itself (`writer: 'hook'`), never the plugin's instance.
 
-**3. `plugin/index.js`'s own, separate AMP instance cache** — a single module-level `_instanceId`, persisted to `/tmp/amp-session-state.json` so it survives a gateway restart, used by `ensureInstance()` for the actual tool-call governance path (`before_tool_call`/`checkToolPolicy`). This is reset on `session_start` (i.e. `/new`/`/reset`, or a genuinely new OpenClaw session) — both the in-memory cache and the persisted file are cleared, so the next governed tool call creates a fresh AMP instance instead of silently reusing the old one.
+**3. `plugin/index.js`'s own, separate AMP instance cache** — a single module-level `_instanceId`, persisted to `$OPENCLAW_STATE_DIR/hooks/amp/plugin-session.json` (default `~/.openclaw/hooks/amp/`, tagged `writer: 'plugin'`) so it survives a gateway restart, used by `ensureInstance()` for the actual tool-call governance path (`before_tool_call`/`checkToolPolicy`). This is reset on `session_start` (i.e. `/new`/`/reset`, or a genuinely new OpenClaw session) — both the in-memory cache and the persisted file are cleared, so the next governed tool call creates a fresh AMP instance instead of silently reusing the old one.
 
-Because (1) and (3) are independent, a stuck session can need clearing on either side: OpenClaw's own chat context (stale/confused model memory) and/or AOC's AMP instance cache (governance events still logging under an old instance ID). `scripts/clear-session.sh` clears both in one step.
+Because (1) and (3) are independent, a stuck session can need clearing on either side: OpenClaw's own chat context (stale/confused model memory) and/or AOC's AMP instance cache (governance events still logging under an old instance ID). `scripts/clear-session.sh` clears both in one step (it also deletes the pre-1.1.11 shared `/tmp/amp-session-state.json` if one is left over).
 
 ## Governance Policy
 
@@ -263,19 +279,21 @@ A sample policy template covering web search, file access, bash, payments, stock
 ## Troubleshooting
 
 **Agent says "no active governance policy"**
-You need to create and activate a policy in AMP first (see [5-Minute Quick Start](#5-minute-quick-start) step 3).
+You need to create and activate a policy in AMP first (see [5-Minute Quick Start](#5-minute-quick-start) step 3). Note the reverse case: an agent with **no policy folder at all** may get `no-hitl` from AMP and run **ungoverned** until the AMP backend is updated to fail closed for it — always save a policy before relying on governance.
 
 **Plugin not loading after install**
 Make sure you restarted OpenClaw. Check logs for `[AMP Governance]` lines.
 
 **Config file not found**
-The plugin reads config from `~/.openclaw/hooks/amp/amp_config.json`. If the file is missing, reinstall the plugin — it will recreate the template on next `gateway_start`.
+The plugin reads config from `$OPENCLAW_STATE_DIR/hooks/amp/amp_config.json` (default `~/.openclaw/hooks/amp/amp_config.json`). If the file is missing, reinstall the plugin — it will recreate the template on next `gateway_start`.
 
 **Hook files not deployed automatically**
 Check that `~/.openclaw/extensions/amp-governance/hook/` exists. If not, reinstall the plugin. You can also copy the files manually from the `plugin/hook/` directory in this repository.
 
 **HITL approval times out**
 By default the agent waits up to 10 minutes for a human decision. If no one approves in time, the tool call is blocked. To extend the window, set `HITL_TIMEOUT_MINUTES` in `amp_config.json` (e.g. `30` for 30 minutes) and restart OpenClaw. Make sure you have AMP notifications enabled so you see approval requests promptly.
+
+OpenClaw ≥ 2026.9 gives `before_tool_call` 15 s by default. The plugin requests `HITL_TIMEOUT_MINUTES` + 30 s; an operator override in `openclaw.json` (`plugins.entries.amp-governance.hooks.timeouts.before_tool_call`, max 600000) wins over it — keep it ≥ your HITL timeout + 30 s.
 
 **No outage notification, but the agent seems unresponsive**
 Outage detection (see [AMP Outage Detection](#amp-outage-detection)) only fires off a real governance call — if AMP goes down during a purely conversational exchange that never triggers a tool call, you won't see a notification until the next tool call is attempted. Send a message that requires a tool (e.g. a web search) to confirm whether AMP is actually reachable.
@@ -324,6 +342,8 @@ openclaw/
 ├── scripts/
 │   └── clear-session.sh   # Clear a stuck OpenClaw session + AMP instance cache (see Troubleshooting)
 │
+├── test/                 # node:test suite (npm test) — helpers/ stub AMP backend + fake api, fixtures/ for real-host tests
+│
 └── LICENSE
 ```
 
@@ -332,6 +352,15 @@ openclaw/
 **AMP Hook** (`plugin/hook/handler.ts`) — runs inside the OpenClaw gateway process, handling per-conversation lifecycle: creates an AMP agent instance when a new conversation starts, logs every inbound message and tool call to AMP, and closes the instance when the conversation ends (see [Session Lifecycle](#session-lifecycle)).
 
 **AMP Governance Plugin** (`plugin/index.js`) — published to npm as `@inquiryon/amp-governance`. Intercepts every tool call before execution and enforces the AMP governance policy: calls `/api/hitl/request`, sends a WhatsApp/Slack notification and polls for a human decision when HITL is required, returns `{ block: true, blockReason }` to block the tool or `{}` to allow it, and sends a follow-up notification on decision. If AMP is unreachable or misconfigured, it blocks tool execution as a safety measure and resumes automatically once AMP recovers (see [AMP Outage Detection](#amp-outage-detection)).
+
+### Running Tests
+
+From the repository root (Node ≥ 22.18, for TypeScript stripping of `handler.ts`; no dependencies to install):
+
+```bash
+npm test                                             # tier 1: fake OpenClaw api + stub AMP backend
+OC_PKG=<openclaw package dir> npm run test:real     # tier 2: real OpenClaw host (skipped without OC_PKG)
+```
 
 ### Published Package
 
