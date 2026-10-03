@@ -73,6 +73,7 @@ export async function loadPlugin(options = {}) {
 
   const handlers = {};
   const opts = {};
+  const cliRegistrars = [];
   const runtimeCalls = [];
   const loggerErrors = [];
   const fakeApi = {
@@ -80,6 +81,7 @@ export async function loadPlugin(options = {}) {
     config: options.apiConfig,
     runtime: options.runtime ?? makeFakeRuntime(runtimeCalls),
     source: undefined, // keeps hook auto-deploy off
+    registerCli(fn, cliOpts) { cliRegistrars.push({ fn, opts: cliOpts }); },
     on(name, fn, hookOpts) {
       handlers[name] = fn;
       opts[name] = hookOpts;
@@ -102,5 +104,5 @@ export async function loadPlugin(options = {}) {
   // Register the same module instance again (config reload); later api.on calls replace handlers.
   const reregister = (apiOverrides = {}) => mod.register({ ...fakeApi, ...apiOverrides });
 
-  return { handlers, opts, stub, stateDir, config, runtimeCalls, loggerErrors, callTool, reregister, cleanup };
+  return { handlers, opts, cliRegistrars, stub, stateDir, config, runtimeCalls, loggerErrors, callTool, reregister, cleanup };
 }

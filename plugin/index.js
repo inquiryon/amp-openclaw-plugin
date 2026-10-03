@@ -223,7 +223,9 @@ function runAmpConnect(opts) {
       AMP_ORG_ID: opts.orgId,
       HITL_TIMEOUT_MINUTES: Number(opts.hitlTimeout) || 10,
     };
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(newConfig, null, 2) + '\n');
+    // LOW6: the file holds the API key — owner-only, also when replacing an existing file.
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(newConfig, null, 2) + '\n', { mode: 0o600 });
+    try { fs.chmodSync(CONFIG_FILE, 0o600); } catch (err) { console.warn(`! Could not restrict ${CONFIG_FILE} to 0600: ${err.message}`); }
     console.log('✓ Config written.');
   } catch (err) {
     console.error(`✗ Failed to write config: ${err.message}`);
@@ -250,6 +252,17 @@ function runAmpConnect(opts) {
   }
 
   console.log(`✓ Connected — agent "${opts.agentName}" is now governed by AMP.`);
+}
+
+/**
+ * LOW6: best-effort repair of an amp_config.json that group/other can access
+ * (it holds the API key). Errors are ignored; a no-op where modes are not
+ * enforced (e.g. NTFS under WSL).
+ */
+function restrictConfigMode() {
+  try {
+    if (fs.statSync(CONFIG_FILE).mode & 0o077) fs.chmodSync(CONFIG_FILE, 0o600);
+  } catch {}
 }
 
 function readSession() {
@@ -1207,6 +1220,7 @@ export default {
     // register() is guaranteed to run on every plugin load, whereas relying on
     // a later event left this silently dead (api.rootDir was always undefined).
     if (api.source) deployHookFilesIfNeeded(path.dirname(api.source));
+    restrictConfigMode();
 
     // ── CLI: `openclaw amp connect` ───────────────────────────────────────────
     if (typeof api.registerCli === 'function') {
