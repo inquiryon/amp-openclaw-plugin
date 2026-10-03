@@ -653,7 +653,8 @@ const UNVERIFIABLE_METHODS = new Set(['auto', 'fallback']);
  * (request response or pending poll). An unbound call never accepts a terminal
  * body: after a restart the seen set is empty and get-decision returns the
  * restored instance's last resolved work item (H3). Fail-closed: a review that
- * resolves before the first poll times out and blocks.
+ * resolves before the first poll times out and blocks. Exception (K1, Wave 3
+ * S08c): a cancelled body whose id is unseen ends an unbound call — it can only block.
  */
 function classifyDecision(data, bound, seen) {
   const id = nonEmptyId(data.workitem_id);

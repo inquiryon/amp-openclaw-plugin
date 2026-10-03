@@ -511,6 +511,22 @@ describe('K1 — a cancelled review ends an unbound call at once', () => {
     assert.deepEqual(requestsOf(p).map((r) => r.body.caller_id), ['inst-1', 'inst-2']);
   });
 
+  for (const [name, body] of [
+    ['complete + workitem_status Cancelled + resolution approve', { status: 'complete', resolution: 'approve', workitem_status: 'Cancelled', workitem_id: 'wi-1' }],
+    ['id-less status cancelled', { status: 'cancelled' }],
+  ]) {
+    test(`unbound call, ${name}: blocks as cancelled (never an allow) and retires`, async (t) => {
+      const p = await setup(t);
+      p.stub.script('POST /api/hitl/request', [pending(null), ok({ status: 'no-hitl' })]);
+      p.stub.script('GET /api/hitl/get-decision', [ok(body)]);
+      const a = await p.callTool('exec', { command: 'one' });
+      assert.equal(a.block, true, JSON.stringify(a));
+      assert.match(a.blockReason, /cancelled/);
+      assert.deepEqual(await p.callTool('exec', { command: 'two' }), {});
+      assert.deepEqual(requestsOf(p).map((r) => r.body.caller_id), ['inst-1', 'inst-2']);
+    });
+  }
+
   test('a cancelled body for a work item this instance already saw is still ignored', async (t) => {
     const p = await setup(t);
     // Call A binds wi-1 and is approved; call B (unbound) then sees wi-1 reported Cancelled -> ignore, wait for its own.
