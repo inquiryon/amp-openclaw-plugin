@@ -886,10 +886,12 @@ async function requestResponseOutcome(hitlResponse, instanceId, tool, opts) {
     await ampLog(instanceId, msg, 'ERROR');
     return blockOutcome(msg);
   }
-  if (status === 'pending' || status === 'waiting-for-response' || requestWorkitemId) {
+  // OC-5: only a pending status starts a review wait; a workitem_id alone never does.
+  if (status === 'pending' || status === 'waiting-for-response') {
     return awaitHitlDecision(instanceId, tool, { ...opts, boundWorkitemId });
   }
-  // Unknown response — fail CLOSED. The request reached AMP: a work item may exist.
+  // Unknown response (incl. e.g. 'denied' with a workitem_id) — fail CLOSED.
+  // The request reached AMP: a work item may exist, so the instance is retired.
   const msg = `Tool call "${tool}" blocked — AMP returned an unexpected status "${status || 'missing'}".`;
   console.error('[AMP Governance] Unexpected HITL response:', JSON.stringify(hitlResponse));
   await ampLog(instanceId, `${msg} Body: ${JSON.stringify(hitlResponse)}`, 'ERROR');

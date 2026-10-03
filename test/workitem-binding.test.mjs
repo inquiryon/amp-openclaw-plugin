@@ -277,3 +277,28 @@ describe('id-less auto / fallback decisions', () => {
     assert.equal(p.stub.count(...DECISION), 3);
   }));
 });
+
+// OC-5: only a pending request status starts a HITL wait. Any other status is
+// unexpected and blocks, even when the body carries a workitem_id; the work item
+// may exist, so the instance is retired (K2.3).
+describe('OC-5 — a workitem_id never turns another request status into a review', () => {
+  for (const status of ['denied', 'rejected', 'banana', '']) {
+    test(`request status ${JSON.stringify(status)} with a workitem_id blocks without polling`, (t) => withPlugin(t, async (p) => {
+      p.stub.script('POST /api/hitl/request', [ok({ status, workitem_id: 'wi-1' }), ok({ status: 'no-hitl' })]);
+      p.stub.script('GET /api/hitl/get-decision', [done('approve', 'wi-1')]);
+      const res = await exec(p);
+      assert.equal(res?.block, true, `must not allow: ${JSON.stringify(res)}`);
+      assert.match(res.blockReason, /unexpected status/);
+      assert.equal(p.stub.count(...DECISION), 0);
+      assert.deepEqual(await exec(p), {});
+      assert.equal(p.stub.count('POST', '/api/agent/init'), 2, 'instance retired');
+    }));
+  }
+
+  test('waiting-for-response still waits for the review', (t) => withPlugin(t, async (p) => {
+    p.stub.script('POST /api/hitl/request', [ok({ status: 'waiting-for-response' })]);
+    p.stub.script('GET /api/hitl/get-decision', [pending('wi-1'), done('approve', 'wi-1')]);
+    assert.deepEqual(await exec(p), {});
+    assert.equal(p.stub.count(...DECISION), 2);
+  }));
+});
