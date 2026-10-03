@@ -184,10 +184,17 @@ describe('C10 — one AMP review at a time per instance', () => {
     const base = p.stub.requests().length;
     p.stub.script('POST /api/hitl/request', [pending(null)]);
     p.stub.script('GET /api/hitl/get-decision', [pending('wi-X'), done('approve', 'wi-X')]);
-    const results = await Promise.all([exec(p), exec(p)]);
-    const allowed = results.filter((r) => r && Object.keys(r).length === 0);
-    assert.ok(allowed.length <= 1, `at most one call may run: ${JSON.stringify(results)}`);
+    const commands = ['echo 1', 'echo 2'];
+    const results = await Promise.all(commands.map((command) => p.callTool('exec', { command })));
     const reqs = indexesOf(p, 'POST', '/api/hitl/request').filter((i) => i >= base);
+    // The call whose request reached AMP first holds the lock and gets wi-X's
+    // approval; the other may not reuse it and times out.
+    const firstIdx = commands.indexOf(p.stub.requests()[reqs[0]].body.context.command);
+    assert.ok(firstIdx >= 0, 'first request must carry one of the two commands');
+    assert.deepEqual(results[firstIdx], {}, `first call must be allowed: ${JSON.stringify(results)}`);
+    const second = results[1 - firstIdx];
+    assert.equal(second?.block, true, `second call must be blocked: ${JSON.stringify(results)}`);
+    assert.match(second.blockReason, /timed out/);
     const polls = indexesOf(p, ...DECISION).filter((i) => i >= base);
     assert.equal(reqs.length, 2);
     const approveIdx = polls[1]; // second poll of the run answered approve wi-X

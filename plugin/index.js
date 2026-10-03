@@ -800,6 +800,12 @@ async function requestAndAwaitDecision(instanceId, tool, params, { signal, actio
 
     if (resolution === 'approve' || resolution === 'approved') {
       await ampLog(instanceId, `HITL approved: ${tool} | workitem: ${decision.workitem_id}`);
+      // Last check after the final await: a run cancelled meanwhile must not proceed.
+      if (signal?.aborted) {
+        const msg = `Tool call "${tool}" blocked — run cancelled before the AMP approval could be applied.`;
+        await ampLog(instanceId, `${msg} | workitem: ${decision.workitem_id}`, 'WARN');
+        return { block: true, blockReason: msg };
+      }
       notifyUser(_lastSender, `The reviewer approved "${tool}" — continuing now.`);
       return {};
     }

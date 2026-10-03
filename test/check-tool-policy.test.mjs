@@ -311,4 +311,17 @@ describe('L — an aborted run never proceeds on an allow status', () => {
     assert.match(res.blockReason, /run cancelled/);
     assert.equal(p.stub.count('POST', '/api/hitl/request'), 1);
   }));
+
+  test('signal aborted by the time the poll returns approve -> block', (t) => withPlugin(t, 'hitl_approve', async (p) => {
+    // Reads not-aborted until AMP has answered the first poll, aborted afterwards.
+    const signal = {
+      get aborted() { return p.stub.count(...DECISION) > 0; },
+      addEventListener() {},
+      removeEventListener() {},
+    };
+    const res = await p.callTool('exec', { command: 'echo hi' }, { abortSignal: signal });
+    assert.equal(res?.block, true, JSON.stringify(res));
+    assert.match(res.blockReason, /run cancelled/);
+    assert.equal(p.stub.count(...DECISION), 1);
+  }));
 });
