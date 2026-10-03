@@ -1,0 +1,9 @@
+{
+  "name": "amp-openclaw-plugin-dev",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 test/*.test.mjs",
+    "test:real": "node --test --test-concurrency=1 test/real-openclaw.test.mjs"
+  }
+}
