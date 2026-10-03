@@ -145,12 +145,28 @@ describe('real OpenClaw host', { skip: SKIP }, () => {
     assert.ok(toolReport.steps.typedHooks.includes('before_tool_call'));
   });
 
+  // Codex #7: the real tool wrapper is required — a missing wrapper must fail, never skip.
+  test('the real tool wrapper (wrapToolWithBeforeToolCallHook) was found', () => {
+    assert.ok(toolReport.steps.wrapChunk, JSON.stringify(toolReport.steps.wrapChunk));
+    assert.ok(toolReport.steps.gateChunk, JSON.stringify(toolReport.steps.gateChunk));
+  });
+
   for (const { mode, blocked } of MODES) {
-    test(`${mode}: host gate blocked=${blocked}`, () => {
+    test(`${mode}: host gate blocked=${blocked}, wrapped tool executed=${!blocked}`, () => {
       const r = toolReport.modes[mode];
       assert.ok(r?.hostGate && !r.hostGate.threw, JSON.stringify(r?.hostGate));
       assert.equal(r.hostGate.blocked ?? false, blocked, JSON.stringify(r.hostGate));
-      if (r.wrappedTool) assert.equal(r.wrappedTool.executed, !blocked, JSON.stringify(r.wrappedTool));
+      assert.ok(r.wrappedTool, `no wrapped-tool run for ${mode}`);
+      assert.equal(r.wrappedTool.executed, !blocked, JSON.stringify(r.wrappedTool));
+    });
+  }
+
+  // The stub's HITL request is id-less like production (H3): the plugin learns its work
+  // item from the first (pending) poll and only then accepts that work item's decision.
+  for (const mode of ['hitl_approve', 'hitl_reject', 'hitl_modify']) {
+    test(`${mode}: id-less request, decision taken from the second poll`, () => {
+      const polls = toolReport.modes[mode].stubDuringHostGate.filter((l) => l.startsWith('GET /api/hitl/get-decision'));
+      assert.equal(polls.length, 2, JSON.stringify(toolReport.modes[mode].stubDuringHostGate));
     });
   }
 
