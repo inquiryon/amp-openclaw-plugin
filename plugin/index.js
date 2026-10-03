@@ -673,6 +673,11 @@ async function requestAndAwaitDecision(instanceId, tool, params, { signal, actio
 
   // ── Eval engine approved — allow (set mirrors Hermes HP __init__.py:772) ──
   if (status === 'no-hitl' || status === 'allow' || status === 'allowed' || status === 'approved') {
+    if (signal?.aborted) {
+      const msg = `Tool call "${tool}" blocked — run cancelled before the AMP allow could be applied.`;
+      await ampLog(instanceId, msg, 'WARN');
+      return { block: true, blockReason: msg };
+    }
     console.log(`[AMP Governance] Policy approved: ${tool} (${reason || 'ok'})`);
     return {};
   }
@@ -749,10 +754,18 @@ async function requestAndAwaitDecision(instanceId, tool, params, { signal, actio
       return { block: true, blockReason: msg };
     }
 
-    // Rejected
-    const msg = `Tool call "${tool}" was rejected by a human reviewer.${info}`;
-    await ampLog(instanceId, `HITL rejected: ${tool} | workitem: ${decision.workitem_id}`, 'WARN');
-    notifyUser(_lastSender, `The reviewer rejected "${tool}".${info}`);
+    if (resolution === 'reject' || resolution === 'rejected') {
+      const msg = `Tool call "${tool}" was rejected by a human reviewer.${info}`;
+      await ampLog(instanceId, `HITL rejected: ${tool} | workitem: ${decision.workitem_id}`, 'WARN');
+      notifyUser(_lastSender, `The reviewer rejected "${tool}".${info}`);
+      return { block: true, blockReason: msg };
+    }
+
+    // Empty, expired or unknown resolution: no decision to act on (K5).
+    const msg = `Tool call "${tool}": AMP returned no usable decision (resolution=${resolution}) — blocked.`;
+    console.error(`[AMP Governance] ${msg}`);
+    await ampLog(instanceId, `${msg} | workitem: ${decision.workitem_id}`, 'ERROR');
+    notifyUser(_lastSender, `AMP returned no usable decision for "${tool}" — the call was blocked.`);
     return { block: true, blockReason: msg };
   }
 

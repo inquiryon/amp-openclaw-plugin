@@ -270,3 +270,45 @@ describe('modes matrix', () => {
     }));
   }
 });
+
+describe('L — vocabulary: only reject/rejected reads as a reviewer rejection', () => {
+  const ok = (body) => ({ status: 200, body });
+
+  for (const resolution of ['reject', 'rejected']) {
+    test(`resolution ${resolution} blocks as rejected by a reviewer`, (t) => withPlugin(t, 'hitl_approve', async (p) => {
+      p.stub.script('GET /api/hitl/get-decision', [ok({ status: 'complete', resolution, workitem_id: 'wi-1' })]);
+      const res = await p.callTool('exec', { command: 'echo hi' });
+      assert.equal(res?.block, true);
+      assert.match(res.blockReason, /rejected by a human reviewer/);
+    }));
+  }
+
+  for (const resolution of ['', 'expired', 'banana', null]) {
+    test(`resolution ${JSON.stringify(resolution)} blocks with "no usable decision"`, (t) => withPlugin(t, 'hitl_approve', async (p) => {
+      p.stub.script('GET /api/hitl/get-decision', [ok({ status: 'complete', resolution, workitem_id: 'wi-1' })]);
+      const res = await p.callTool('exec', { command: 'echo hi' });
+      assert.equal(res?.block, true, JSON.stringify(res));
+      const shown = String(resolution ?? '').toLowerCase();
+      assert.ok(
+        res.blockReason.includes(`AMP returned no usable decision (resolution=${shown}) — blocked`),
+        res.blockReason,
+      );
+      assert.doesNotMatch(res.blockReason, /rejected by/);
+    }));
+  }
+});
+
+describe('L — an aborted run never proceeds on an allow status', () => {
+  test('signal aborted by the time the request returns no-hitl -> block', (t) => withPlugin(t, 'allow', async (p) => {
+    // Reads not-aborted until AMP has received the request, aborted afterwards.
+    const signal = {
+      get aborted() { return p.stub.count('POST', '/api/hitl/request') > 0; },
+      addEventListener() {},
+      removeEventListener() {},
+    };
+    const res = await p.callTool('exec', { command: 'echo hi' }, { abortSignal: signal });
+    assert.equal(res?.block, true, JSON.stringify(res));
+    assert.match(res.blockReason, /run cancelled/);
+    assert.equal(p.stub.count('POST', '/api/hitl/request'), 1);
+  }));
+});
