@@ -712,7 +712,9 @@ async function checkToolPolicy(instanceId, tool, params, { signal, actionId, dea
   const release = await acquireInstanceLock(instanceId, callDeadline, signal);
   if (!release) {
     const why = contended ? 'another AMP review is in progress for this agent instance' : 'the call could not start its AMP review in time';
-    const msg = `Tool call "${tool}" blocked — ${why}${signal?.aborted ? ' (run cancelled while waiting)' : ''}.`;
+    const msg = !contended && !signal?.aborted && _hookBudgetLimitMs !== null
+      ? budgetExhaustedMessage(tool)
+      : `Tool call "${tool}" blocked — ${why}${signal?.aborted ? ' (run cancelled while waiting)' : ''}.`;
     console.warn(`[AMP Governance] ${msg}`);
     await ampLog(instanceId, msg, 'WARN');
     return { block: true, blockReason: msg };
@@ -736,8 +738,8 @@ async function requestAndAwaitDecision(instanceId, tool, params, { signal, actio
   let hitlResponse;
   try {
     hitlResponse = await requestHitlEval(instanceId, tool, params, actionId, { signal, deadline });
-    // Successful contact with AMP — clear any prior down state
-    await notifyAmpRecovered();
+    // Successful contact with AMP — clear any prior down state (notification is fire-and-forget)
+    notifyAmpRecovered().catch(() => {});
   } catch (err) {
     const em = err && err.message ? err.message : String(err);
     console.error(`[AMP Governance] HITL request failed — blocking tool "${tool}": ${em}`);
@@ -748,8 +750,14 @@ async function requestAndAwaitDecision(instanceId, tool, params, { signal, actio
     if (signal?.aborted) {
       return { block: true, blockReason: `Tool call "${tool}" blocked — run cancelled before AMP answered the policy check.` };
     }
+    // Cut by this call's own deadline (not the per-request cap): a budget miss, not an outage.
+    if (isRequestTimeout(err, signal) && deadline != null && deadline - Date.now() < 50) {
+      const msg = budgetExhaustedMessage(tool);
+      console.error(`[AMP Governance] ${msg}`);
+      return { block: true, blockReason: msg };
+    }
     _ampReachable = false;
-    await notifyAmpDown(tool, em);
+    notifyAmpDown(tool, em).catch(() => {}); // fire-and-forget: never holds the call or the instance slot
     if (isRequestTimeout(err, signal)) {
       return { block: true, blockReason: `AMP Governance service did not answer the policy check in time. Tool "${tool}" was blocked as a safety measure.` };
     }

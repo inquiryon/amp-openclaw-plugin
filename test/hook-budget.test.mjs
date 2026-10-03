@@ -62,6 +62,17 @@ test('slow /api/log cannot carry the call past its hook budget', { timeout: 8_00
   p.stub.script('POST /api/log', [{ status: 200, body: { ok: true }, delayMs: 30_000 }]);
   const res = await p.callTool('exec', { command: 'echo hi' });
   assert.equal(res.block, true);
+  assert.match(res.blockReason, /OpenClaw hook budget/);
+});
+
+test('a policy check cut by the call budget is a budget block, not an AMP outage', { timeout: 10_000 }, async (t) => {
+  // budget 1.5 s; /api/hitl/request answers after 4 s -> cut by the call deadline.
+  const p = await load(t, { apiConfig: override({ timeouts: { before_tool_call: 2000 } }), mode: 'allow' });
+  p.stub.script('POST /api/hitl/request', [{ status: 200, body: { status: 'no-hitl' }, delayMs: 4000 }]);
+  const res = await p.callTool('exec', { command: 'echo hi' });
+  assert.equal(res.block, true);
+  assert.match(res.blockReason, /OpenClaw hook budget/);
+  assert.doesNotMatch(res.blockReason, /did not answer|unreachable/);
 });
 
 test('budget too small to start a request blocks without an AMP outage', async (t) => {
