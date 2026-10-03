@@ -15,6 +15,9 @@ metadata:
 This hook integrates OpenClaw with the **Inquiryon AMP (Agent Management Platform)** to provide governance, activity logging, and lifecycle management.
 
 ## Integration Lifecycle
-1. **Init**: Triggered on `task:start`.
-2. **Log**: Triggered on `tool:end` for agentic actions.
-3. **SetState**: Triggered on `task:end` to finalize the instance.
+1. **Init**: on the first inbound `message:received` for a conversation (a new AMP instance via `/api/agent/init`).
+2. **Log**: each inbound prompt is logged to AMP as `User prompt: ...`. `message:sent` (agent replies) is not logged as a prompt.
+3. **Tools**: `tool:*` / `task:*` events are not delivered by OpenClaw (>= 2026.7) — tool logging and governance live in the plugin (`index.js`).
+4. **SetState**: on restart, an orphaned hook-owned instance is finalized from `$OPENCLAW_STATE_DIR/hooks/amp/hook-session.json` (default `~/.openclaw/...`). The plugin keeps its own `plugin-session.json`; neither side touches the other's instance.
+
+Config is read from `$OPENCLAW_STATE_DIR/hooks/amp/amp_config.json` (default `~/.openclaw/hooks/amp/amp_config.json`). If it is missing or invalid the hook does nothing and retries on the next event.

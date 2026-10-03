@@ -18,7 +18,11 @@ function resolveOpenClawStateDir() {
 }
 
 const OPENCLAW_STATE_DIR = resolveOpenClawStateDir();
-const SESSION_FILE = '/tmp/amp-session-state.json';
+// Plugin-owned session record. The hook keeps its own hook-session.json next to
+// it; records are tagged with their writer so neither side adopts or finalizes
+// the other's instance (A13, #22/#23). The legacy shared /tmp file is never read.
+const SESSION_WRITER = 'plugin';
+const SESSION_FILE = path.join(OPENCLAW_STATE_DIR, 'hooks/amp/plugin-session.json');
 const CONFIG_FILE = `${OPENCLAW_STATE_DIR}/hooks/amp/amp_config.json`;
 
 // Tools that are internal/noisy — skip logging and policy checks
@@ -176,7 +180,8 @@ function runAmpConnect(opts) {
 
 function readSession() {
   try {
-    return JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8'));
+    const session = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8'));
+    return session?.writer === SESSION_WRITER ? session : null;
   } catch {
     return null;
   }
@@ -184,7 +189,8 @@ function readSession() {
 
 function writeSession(instanceId) {
   try {
-    fs.writeFileSync(SESSION_FILE, JSON.stringify({ instanceId }), 'utf-8');
+    fs.mkdirSync(path.dirname(SESSION_FILE), { recursive: true });
+    fs.writeFileSync(SESSION_FILE, JSON.stringify({ instanceId, writer: SESSION_WRITER }), 'utf-8');
   } catch (err) {
     console.error('[AMP Governance] writeSession failed:', err.message);
   }

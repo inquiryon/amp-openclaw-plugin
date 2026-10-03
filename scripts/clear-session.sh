@@ -24,7 +24,13 @@
 
 set -euo pipefail
 
-AMP_SESSION_FILE="/tmp/amp-session-state.json"  # matches plugin/index.js's SESSION_FILE
+# Resolved like plugin/index.js and plugin/hook/handler.ts resolve the OpenClaw state dir.
+AMP_STATE_DIR="${OPENCLAW_STATE_DIR:-${CLAWDBOT_STATE_DIR:-$HOME/.openclaw}}"
+AMP_SESSION_FILES=(
+  "$AMP_STATE_DIR/hooks/amp/plugin-session.json"  # plugin/index.js SESSION_FILE
+  "$AMP_STATE_DIR/hooks/amp/hook-session.json"    # plugin/hook/handler.ts sessionFile()
+  "/tmp/amp-session-state.json"                   # pre-A13 shared file (upgrade cleanup)
+)
 
 if [ "${1:-}" = "--list" ]; then
   openclaw sessions --agent "${2:-main}" --active 1440
@@ -65,10 +71,15 @@ if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
   echo "Deleted transcript: $TRANSCRIPT"
 fi
 
-if [ -f "$AMP_SESSION_FILE" ]; then
-  rm -f "$AMP_SESSION_FILE"
-  echo "Cleared AMP instance cache: $AMP_SESSION_FILE"
-else
+AMP_CLEARED=0
+for AMP_SESSION_FILE in "${AMP_SESSION_FILES[@]}"; do
+  if [ -f "$AMP_SESSION_FILE" ]; then
+    rm -f "$AMP_SESSION_FILE"
+    echo "Cleared AMP instance cache: $AMP_SESSION_FILE"
+    AMP_CLEARED=1
+  fi
+done
+if [ "$AMP_CLEARED" -eq 0 ]; then
   echo "No AMP instance cache to clear."
 fi
 

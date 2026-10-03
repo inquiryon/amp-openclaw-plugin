@@ -9,23 +9,11 @@ import { startStub } from './stub-server.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ENTRY = path.resolve(HERE, '../../plugin/index.js');
 
-// R14: until A13 moves it, index.js keeps its session in this shared file.
-// Back up a real user's copy, start each case without it, and restore afterwards.
+// Pre-A13 location of the shared session file. The plugin no longer reads or
+// writes it (A13); kept for the real-host test, which still guards it.
 export const LEGACY_SESSION_FILE = '/tmp/amp-session-state.json';
 
 let caseCounter = 0;
-
-function backupLegacySession() {
-  let original = null;
-  if (fs.existsSync(LEGACY_SESSION_FILE)) {
-    original = fs.readFileSync(LEGACY_SESSION_FILE);
-    fs.unlinkSync(LEGACY_SESSION_FILE);
-  }
-  return () => {
-    fs.rmSync(LEGACY_SESSION_FILE, { force: true });
-    if (original !== null) fs.writeFileSync(LEGACY_SESSION_FILE, original);
-  };
-}
 
 function makeFakeRuntime(calls) {
   const record = (name) => async (...args) => { calls.push({ name, args }); };
@@ -49,7 +37,6 @@ export async function loadPlugin(options = {}) {
   const stub = options.stub ?? await startStub();
   if (options.mode) stub.setMode(options.mode);
 
-  const restoreSession = backupLegacySession();
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amp-oc-test-'));
   const configDir = path.join(stateDir, 'hooks', 'amp');
   fs.mkdirSync(configDir, { recursive: true });
@@ -79,7 +66,6 @@ export async function loadPlugin(options = {}) {
     mod = (await import(href)).default;
   } catch (err) {
     restoreEnv();
-    restoreSession();
     throw err;
   }
 
@@ -105,7 +91,6 @@ export async function loadPlugin(options = {}) {
 
   const cleanup = async () => {
     restoreEnv();
-    restoreSession();
     fs.rmSync(stateDir, { recursive: true, force: true });
     if (ownStub) await stub.close();
   };
