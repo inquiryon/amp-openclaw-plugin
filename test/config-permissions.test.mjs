@@ -81,15 +81,25 @@ describe('LOW6 — amp_config.json is owner-only', { skip: process.platform === 
     fs.chmodSync(configPath(p), 0o644);
     const before = dirEntries(p);
     const exposed = [];
+    const events = [];
+    const check = (where, mode) => { if (mode & 0o077) exposed.push(`${where} ${(mode & 0o777).toString(8)}`); };
     patchFs(t, 'writeFileSync', (orig) => function (file, data, ...rest) {
       const out = orig.call(this, file, data, ...rest);
-      if (typeof file === 'string' && String(data).includes('amp_k_secret') && (fs.statSync(file).mode & 0o077)) {
-        exposed.push(`${file} ${(fs.statSync(file).mode & 0o777).toString(8)}`);
-      }
+      if (typeof file === 'string' && String(data).includes('amp_k_secret')) { events.push('write'); check(file, fs.statSync(file).mode); }
       return out;
     });
+    patchFs(t, 'writeSync', (orig) => function (fd, data, ...rest) {
+      const out = orig.call(this, fd, data, ...rest);
+      if (String(data).includes('amp_k_secret')) { events.push('write'); check(`fd ${fd}`, fs.fstatSync(fd).mode); }
+      return out;
+    });
+    patchFs(t, 'fsyncSync', (orig) => function (fd) { events.push('fsync'); return orig.call(this, fd); });
+    patchFs(t, 'renameSync', (orig) => function (...args) { events.push('rename'); return orig.apply(this, args); });
     runConnect(p);
     assert.deepEqual(exposed, [], 'key written while group/other could read the file');
+    assert.ok(events.includes('write'), 'the key write was observed');
+    // F5: the temp file is fsynced before the rename makes it visible.
+    assert.deepEqual(events.filter((e) => e !== 'write').slice(0, 2), ['fsync', 'rename'], events.join(','));
     assert.equal(JSON.parse(fs.readFileSync(configPath(p), 'utf8')).AMP_API_KEY, 'amp_k_secret');
     assert.equal(modeOf(configPath(p)).toString(8), '600');
     assert.deepEqual(dirEntries(p), before, 'no temp file left behind');

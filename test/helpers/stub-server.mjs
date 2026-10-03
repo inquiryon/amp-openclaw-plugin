@@ -46,10 +46,13 @@ function complete(state, resolution, extra = {}) {
 // Each mode: { request(state, body) -> response, decision?(state) -> response }
 const MODES = {
   allow: { request: () => json(200, { status: 'no-hitl', reason: 'stub: policy allows' }) },
-  no_policy: { request: () => json(200, { status: 'no_policy' }) },
+  // Production shapes from proxy_hitl (backend fix/hitl-phase0 @ 1789116).
+  no_policy: { request: () => json(200, { status: 'no_policy', policy_configured: false }) },
   policy_error: { request: () => json(500, { error: 'stub: evaluator crashed' }) },
   policy_error_200: {
     request: () => json(200, {
+      policy: 'eval',
+      eval_decision: 'hitl',
       status: 'policy_error',
       reason: 'policy_missing_hitl_routing',
       message: 'Missing field(s): who',

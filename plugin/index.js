@@ -261,7 +261,13 @@ function runAmpConnect(opts) {
 function writeConfigAtomically(text) {
   const tmp = path.join(path.dirname(CONFIG_FILE), `.amp_config.json.${process.pid}.${randomUUID()}.tmp`);
   try {
-    fs.writeFileSync(tmp, text, { mode: 0o600, flag: 'wx' });
+    const fd = fs.openSync(tmp, 'wx', 0o600);
+    try {
+      fs.writeSync(fd, text);
+      fs.fsyncSync(fd); // F5: content is durable before the rename makes it visible
+    } finally {
+      fs.closeSync(fd);
+    }
     fs.renameSync(tmp, CONFIG_FILE);
   } catch (err) {
     try { fs.unlinkSync(tmp); } catch {}
@@ -785,7 +791,9 @@ function finishInstance(instanceId) {
 }
 
 // Instances already retired by this process; retiring one again is a no-op.
+// F5: FIFO-capped — an id old enough to fall out is long finished.
 const _retiredInstances = new Set();
+const RETIRED_INSTANCES_CAP = 256;
 
 /**
  * Drops `instanceId` as this process's instance and finishes it in AMP
@@ -798,6 +806,9 @@ function retireInstance(instanceId, why = 'the call ended without a decision for
   if (readSession()?.instanceId === instanceId) clearSession();
   if (_retiredInstances.has(instanceId)) return;
   _retiredInstances.add(instanceId);
+  if (_retiredInstances.size > RETIRED_INSTANCES_CAP) {
+    _retiredInstances.delete(_retiredInstances.values().next().value);
+  }
   _seenWorkitems.delete(instanceId);
   console.warn(`[AMP Governance] Retiring AMP instance ${instanceId}: ${why}; the next call starts a fresh instance.`);
   finishInstance(instanceId);
@@ -893,20 +904,33 @@ async function governedCall(tool, params, { signal, toolCallId, deadline }) {
   await ampLog(instanceId, `Policy check: ${tool} | ${paramSummary}`);
 
   const actionId = ACTION_ID_CORRELATION ? (toolCallId || randomUUID()) : null;
-  let outcome;
+  // F4: retire unless an outcome explicitly says the instance is clean; decided in
+  // `finally` so no throw (even from the catch block) can skip it.
+  let retire = true;
   try {
-    outcome = await requestAndAwaitDecision(instanceId, tool, params, { signal, actionId, deadline });
+    const outcome = await requestAndAwaitDecision(instanceId, tool, params, { signal, actionId, deadline });
+    retire = outcome.retire;
+    return outcome.result;
   } catch (err) {
     // The request may have landed: no accepted decision, so retire (K2.3) and block.
-    outcome = blockOutcome(unexpectedFailureMessage(tool, err), true);
+    return { block: true, blockReason: unexpectedFailureMessage(tool, err) };
+  } finally {
+    if (retire) retireInstance(instanceId);
   }
-  if (outcome.retire) retireInstance(instanceId);
-  return outcome.result;
 }
 
-/** Generic block reason for a throw in the governance path; details go to the log only. */
+/** Never throws, whatever was thrown (F4). */
+function describeThrown(err) {
+  try {
+    return String(err?.stack || err?.message || err);
+  } catch {
+    return '<unprintable thrown value>';
+  }
+}
+
+/** Generic block reason for a throw in the governance path; details go to the log only. Never throws. */
 function unexpectedFailureMessage(tool, err) {
-  console.error(`[AMP Governance] Governance check for "${tool}" threw: ${err?.stack || err?.message || String(err)}`);
+  try { console.error(`[AMP Governance] Governance check for "${tool}" threw: ${describeThrown(err)}`); } catch {}
   return `Tool call "${tool}": AMP governance failed unexpectedly — blocked.`;
 }
 
@@ -931,22 +955,36 @@ async function requestAndAwaitDecision(instanceId, tool, params, { signal, actio
 }
 
 // ── BACKEND-NATIVE REFUSALS (K2.3) ──────────────────────────────────────────
-// The backend proxies agent-hitl's HTTP status and body unchanged
-// (inquiryon_amp_backend app.py:10000-10019), so a 4xx or an error body may
-// come from agent-hitl after it created a work item. Only the backend's own
-// early returns, made before the proxy, prove that no work item exists; they
-// are recognised by body shape. Every other refusal or failure retires.
-// 4xx `error` values the backend returns before proxying (app.py ~9693-9840).
-const BACKEND_NATIVE_4XX_ERRORS = new Set([
-  'call_limit_reached', 'authentication_required', 'instance_not_owned',
-  'invalid_caller_id', 'org_id_required', 'callback_url_required',
+// Backend `proxy_hitl` forwards agent-hitl's HTTP status and body unchanged, so a
+// 4xx or an error body may come from agent-hitl after it created a work item.
+// Only the backend's own early returns, made before the proxy, prove that no
+// work item exists. They are recognised by status code AND error string AND
+// body shape, as emitted by backend fix/hitl-phase0 @ 1789116 (F1). Everything
+// else retires. instance_not_owned / invalid_caller_id retire too (F3): the
+// backend refuses that instance, so only a fresh one can work.
+// 4xx: `_enforce_session_security` (API key) and `proxy_hitl` (call limit,
+// callback and assignee validation).
+const BACKEND_NATIVE_4XX = new Map([
+  ['call_limit_reached', 429],
+  ['invalid_api_key', 401],
+  ['api_key_required', 401],
+  ['callback_url_required', 400],
+  ['invalid_hitl_assignee', 400],
 ]);
-// 200 policy_error reasons the backend returns before proxying (app.py:9524-9545).
+// 200 policy_error from `_validate_effective_hitl_routing`, returned by
+// `proxy_hitl` with policy:'eval' / eval_decision:'hitl'.
 const BACKEND_NATIVE_POLICY_ERROR_REASONS = new Set(['policy_missing_hitl_routing', 'policy_invalid_hitl_assignee']);
+
+/** True when a refused /api/hitl/request is a backend-native early return (no work item). */
+const isBackendNative4xx = (err) => BACKEND_NATIVE_4XX.get(err.error) === err.status;
 
 /** True when a 200 policy-error body is a backend-native early return (no work item). */
 const isBackendNativePolicyError = (body) =>
-  body.status === 'policy_error' && BACKEND_NATIVE_POLICY_ERROR_REASONS.has(body.reason);
+  body.status === 'policy_error' && body.policy === 'eval' && body.eval_decision === 'hitl' &&
+  BACKEND_NATIVE_POLICY_ERROR_REASONS.has(body.reason);
+
+/** True when a no_policy body has the backend's own shape (`proxy_hitl`, before the proxy). */
+const isBackendNativeNoPolicy = (body) => body.status === 'no_policy' && body.policy_configured === false;
 
 /**
  * /api/hitl/request failed. Unless the backend itself refused it before
@@ -960,7 +998,7 @@ async function requestFailureOutcome(err, instanceId, tool, signal) {
   // LOW2: AMP answered and refused (auth, bad request, rate limit) — not an outage.
   if (err instanceof AmpRejectedRequestError) {
     return blockOutcome(`Tool call "${tool}" blocked — AMP rejected the policy check (HTTP ${err.status}).`,
-      !BACKEND_NATIVE_4XX_ERRORS.has(err.error));
+      !isBackendNative4xx(err));
   }
   if (err instanceof InvalidAmpResponseError) {
     return blockOutcome(`AMP returned an invalid response to the policy check. Tool "${tool}" was blocked as a safety measure.`, true);
@@ -1003,7 +1041,7 @@ async function requestResponseOutcome(hitlResponse, instanceId, tool, opts) {
   if (status === 'no_policy') {
     const msg = `Tool call "${tool}" blocked — no active governance policy for agent "${config.AGENT_NAME}". Contact your administrator.`;
     await ampLog(instanceId, msg, 'WARN');
-    return blockOutcome(msg);
+    return blockOutcome(msg, !isBackendNativeNoPolicy(body));
   }
   if (ALLOW_STATUSES.has(status)) return allowStatusOutcome(instanceId, tool, reason, opts.signal);
   if (POLICY_ERROR_STATUSES.has(status)) {

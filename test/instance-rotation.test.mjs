@@ -255,7 +255,7 @@ describe('K2.3 — one process-wide governance lock', () => {
 });
 
 // Gate-2 HIGH: the backend proxies agent-hitl's status + body unchanged
-// (inquiryon_amp_backend app.py:10000-10019), so a 4xx or an error body may
+// (backend `proxy_hitl`), so a 4xx or an error body may
 // come from agent-hitl after it created a work item. Only early returns the
 // backend itself makes before proxying (recognised by body shape) keep the instance.
 describe('K2.3 — a refused or failed policy check that may have reached agent-hitl retires the instance', () => {
@@ -266,6 +266,17 @@ describe('K2.3 — a refused or failed policy check that may have reached agent-
     ['200 status error', ok({ status: 'error', message: 'notify failed' })],
     ['200 status config_error', ok({ status: 'config_error', message: 'bad config' })],
     ['200 policy_error with another reason', ok({ status: 'policy_error', reason: 'evaluator_crashed' })],
+    // F1: a native error string alone is not proof — status code and body shape must match too.
+    ['HTTP 409 call_limit_reached (native string, wrong status)', { status: 409, body: { error: 'call_limit_reached' } }],
+    ['HTTP 400 call_limit_reached (native string, wrong status)', { status: 400, body: { error: 'call_limit_reached' } }],
+    ['HTTP 401 authentication_required (not emitted by proxy_hitl)', { status: 401, body: { error: 'authentication_required' } }],
+    ['HTTP 400 org_id_required (not emitted by proxy_hitl)', { status: 400, body: { error: 'org_id_required' } }],
+    // F3: the backend refuses the instance itself — a fresh one is needed anyway.
+    ['HTTP 403 instance_not_owned', { status: 403, body: { error: 'instance_not_owned' } }],
+    ['HTTP 400 invalid_caller_id', { status: 400, body: { error: 'invalid_caller_id' } }],
+    ['200 policy_error native reason without policy/eval_decision', ok({ status: 'policy_error', reason: 'policy_invalid_hitl_assignee' })],
+    ['200 policy_error native reason with eval_decision allow', ok({ policy: 'eval', eval_decision: 'allow', status: 'policy_error', reason: 'policy_missing_hitl_routing' })],
+    ['200 no_policy without policy_configured:false', ok({ status: 'no_policy' })],
   ];
   for (const [name, first] of mayHaveLanded) {
     test(`${name}: the next call never binds the late work item`, async (t) => {
@@ -279,13 +290,16 @@ describe('K2.3 — a refused or failed policy check that may have reached agent-
   }
 
   const backendNative = [
-    ['call_limit_reached', { status: 429, body: { error: 'call_limit_reached', used: 5, limit: 5 } }],
-    ['authentication_required', { status: 401, body: { error: 'authentication_required' } }],
-    ['instance_not_owned', { status: 403, body: { error: 'instance_not_owned' } }],
-    ['invalid_caller_id', { status: 400, body: { error: 'invalid_caller_id' } }],
-    ['org_id_required', { status: 400, body: { error: 'org_id_required' } }],
-    ['callback_url_required', { status: 400, body: { error: 'callback_url_required' } }],
-    ['policy_error policy_invalid_hitl_assignee', ok({ status: 'policy_error', reason: 'policy_invalid_hitl_assignee', message: 'bad who' })],
+    // Verified against backend fix/hitl-phase0 @ 1789116 (proxy_hitl and the
+    // _enforce_session_security gate): status code + error string together.
+    ['429 call_limit_reached', { status: 429, body: { error: 'call_limit_reached', used: 5, limit: 5 } }],
+    ['401 invalid_api_key', { status: 401, body: { error: 'invalid_api_key' } }],
+    ['401 api_key_required', { status: 401, body: { error: 'api_key_required' } }],
+    ['400 callback_url_required', { status: 400, body: { error: 'callback_url_required' } }],
+    ['400 invalid_hitl_assignee', { status: 400, body: { error: 'invalid_hitl_assignee' } }],
+    ['policy_error policy_invalid_hitl_assignee', ok({ policy: 'eval', eval_decision: 'hitl', status: 'policy_error', reason: 'policy_invalid_hitl_assignee', message: 'bad who' })],
+    ['policy_error policy_missing_hitl_routing', ok({ policy: 'eval', eval_decision: 'hitl', status: 'policy_error', reason: 'policy_missing_hitl_routing', message: 'Missing who' })],
+    ['no_policy policy_configured:false', ok({ status: 'no_policy', policy_configured: false })],
   ];
   for (const [name, first] of backendNative) {
     test(`backend-native refusal ${name}: no work item can exist, the instance is kept`, async (t) => {
@@ -446,5 +460,34 @@ describe('K2.3 — remaining rotation claims', () => {
     assert.equal(p.stub.count('GET', '/api/hitl/get-decision'), 0, 'A never got to poll');
     aEnded();
     await assertCallBSafe(p, 0);
+  });
+});
+
+// F4: even a thrown value that cannot be stringified must not escape the hook
+// or skip the retire.
+describe('K2.3 — an unprintable throw still blocks and retires', () => {
+  const unprintableThrow = () => { throw Object.create(null); }; // String() on it throws
+
+  test('throw in the decision path after the request was sent: blocked, instance retired', async (t) => {
+    const p = await setup(t);
+    p.stub.script('POST /api/hitl/request', [ok({ status: 'no-hitl' }), ok({ status: 'no-hitl' })]);
+    // A signal-like EventTarget whose `aborted` throws once the request has been sent.
+    const signal = new (class extends EventTarget {
+      get aborted() { if (p.stub.count('POST', '/api/hitl/request') > 0) unprintableThrow(); return false; }
+    })();
+    let a;
+    await assert.doesNotReject(async () => { a = await p.callTool('exec', { command: 'one' }, { abortSignal: signal }); });
+    assert.equal(a.block, true);
+    assert.match(a.blockReason, /AMP governance failed unexpectedly — blocked/);
+    assert.deepEqual(await p.callTool('exec', { command: 'two' }), {});
+    assert.deepEqual(requestsOf(p).map((r) => r.body.caller_id), ['inst-1', 'inst-2']);
+  });
+
+  test('throw before governance starts: blocked, never rethrown', async (t) => {
+    const p = await setup(t);
+    const ctx = { get abortSignal() { return unprintableThrow(); } };
+    let a;
+    await assert.doesNotReject(async () => { a = await p.callTool('exec', { command: 'one' }, ctx); });
+    assert.equal(a.block, true);
   });
 });

@@ -166,11 +166,12 @@ class H(BaseHTTPRequestHandler):
             if mode == "allow":
                 return self._send(200, {"status": "no-hitl", "reason": "stub: policy allows"})
             if mode == "no_policy":
-                return self._send(200, {"status": "no_policy"})
+                return self._send(200, {"status": "no_policy", "policy_configured": False})
             if mode == "policy_error":
                 return self._send(500, {"error": "stub: evaluator crashed"})
             if mode == "policy_error_200":
-                return self._send(200, {"status": "policy_error", "reason": "policy_missing_hitl_routing",
+                return self._send(200, {"policy": "eval", "eval_decision": "hitl",
+                                        "status": "policy_error", "reason": "policy_missing_hitl_routing",
                                         "message": "Missing field(s): who"})
             if mode == "garbage":
                 return self._send(200, {"status": "banana", "weird": True})
