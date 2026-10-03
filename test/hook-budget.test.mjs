@@ -90,6 +90,37 @@ test('an /api/agent/init cut by the call budget is a budget block, not an AMP ou
   assert.equal(p.stub.count('POST', '/api/hitl/request'), 0);
 });
 
+// LOW5: the budget-cut checks used to compare Date.now() with the deadline when the
+// request's timer fired. Timers run on the monotonic clock; the wall clock can lag it
+// (loop-time caching, WSL clock drift), so the cut read as an outage ~1 in 10 runs.
+// Step the wall clock back 200 ms once the request is on the wire to make that
+// deterministic: the cut must still be recognised from the abort itself.
+function stepWallClockBackOnce(t, p, routePath) {
+  const realNow = Date.now;
+  Date.now = () => realNow() - (p.stub.count('POST', routePath) > 0 ? 200 : 0);
+  t.after(() => { Date.now = realNow; });
+}
+
+test('LOW5: a budget-cut /api/agent/init stays a budget block when the wall clock lags the timer', { timeout: 10_000 }, async (t) => {
+  const p = await load(t, { apiConfig: override({ timeouts: { before_tool_call: 2000 } }), mode: 'allow' });
+  p.stub.script('POST /api/agent/init', [{ status: 200, body: { instance_id: 'inst-slow' }, delayMs: 4000 }]);
+  stepWallClockBackOnce(t, p, '/api/agent/init');
+  const res = await p.callTool('exec', { command: 'echo hi' });
+  assert.equal(res.block, true);
+  assert.match(res.blockReason, /OpenClaw hook budget/);
+  assert.equal(p.stub.count('POST', '/api/hitl/request'), 0);
+});
+
+test('LOW5: a budget-cut policy check stays a budget block when the wall clock lags the timer', { timeout: 10_000 }, async (t) => {
+  const p = await load(t, { apiConfig: override({ timeouts: { before_tool_call: 2000 } }), mode: 'allow' });
+  p.stub.script('POST /api/hitl/request', [{ status: 200, body: { status: 'no-hitl' }, delayMs: 4000 }]);
+  stepWallClockBackOnce(t, p, '/api/hitl/request');
+  const res = await p.callTool('exec', { command: 'echo hi' });
+  assert.equal(res.block, true);
+  assert.match(res.blockReason, /OpenClaw hook budget/);
+  assert.doesNotMatch(res.blockReason, /did not answer|unreachable/);
+});
+
 test('budget too small to start a request blocks without an AMP outage', async (t) => {
   // override 400 -> budget 300 ms: below the 500 ms floor for /api/hitl/request.
   const p = await load(t, { apiConfig: override({ timeouts: { before_tool_call: 400 } }), mode: 'allow' });

@@ -112,20 +112,45 @@ const ACTION_ID_WATCHDOG_MS = positiveNumber(config?.ACTION_ID_WATCHDOG_SECONDS,
 // Cap on any single AMP HTTP request (default 15 s); also bounded by the call's deadline.
 const AMP_REQUEST_TIMEOUT_MS = positiveNumber(config?.AMP_REQUEST_TIMEOUT_MS, 15_000);
 
+/** Abort reason when a request is cut by the call's own deadline (a budget miss, not an outage). */
+class CallBudgetCutError extends Error {
+  constructor() {
+    super('AMP request cut by the call\'s hook budget');
+    this.name = 'CallBudgetCutError';
+  }
+}
+
 /**
  * Signal for one AMP request: aborts when the caller's signal does, or after
  * AMP_REQUEST_TIMEOUT_MS, or at the call's deadline — whichever comes first.
+ * A deadline cut aborts with CallBudgetCutError, so callers tell it from a
+ * per-request timeout by the abort reason itself — never by re-reading the
+ * wall clock, which can lag the timer that fired (LOW5).
  */
 function requestSignal(signal, deadline) {
-  const budget = deadline == null ? AMP_REQUEST_TIMEOUT_MS : Math.min(AMP_REQUEST_TIMEOUT_MS, deadline - Date.now());
-  const ms = Math.max(1, Math.floor(budget));
+  const parts = [];
+  const remaining = deadline == null ? Infinity : deadline - Date.now();
+  // Created before the cap timer: on a tie the deadline cut fires first.
+  if (remaining <= AMP_REQUEST_TIMEOUT_MS) parts.push(budgetSignal(remaining));
+  parts.push(AbortSignal.timeout(AMP_REQUEST_TIMEOUT_MS));
   // Only a real AbortSignal can be composed; callers re-check signal.aborted anyway.
-  const callerSignal = signal instanceof AbortSignal ? [signal] : [];
-  return AbortSignal.any([...callerSignal, AbortSignal.timeout(ms)]);
+  if (signal instanceof AbortSignal) parts.push(signal);
+  return AbortSignal.any(parts);
 }
 
-/** True when err is our own request timeout (not a caller abort). */
-const isRequestTimeout = (err, signal) => err?.name === 'TimeoutError' && !signal?.aborted;
+function budgetSignal(ms) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(new CallBudgetCutError()), Math.max(1, Math.floor(ms)));
+  timer.unref?.();
+  return ac.signal;
+}
+
+/** True when err is the call's deadline cut (not a caller abort). */
+const isBudgetCut = (err, signal) => err instanceof CallBudgetCutError && !signal?.aborted;
+
+/** True when err is our own request timeout or deadline cut (not a caller abort). */
+const isRequestTimeout = (err, signal) =>
+  (err?.name === 'TimeoutError' || err instanceof CallBudgetCutError) && !signal?.aborted;
 
 // Module-level instance cache so we only init once per process lifetime
 let _instanceId = null;
@@ -311,8 +336,7 @@ async function ensureInstance() {
     console.error(`[AMP Governance] ensureInstance failed: ${em}${ec ? ` | cause=${ec}` : ''}${target ? ` | url=${target}` : ''}`);
     // Cut by the call's own deadline (W2): a budget miss, not an outage. The backend may
     // still create the instance; a later duplicate is acceptable (never an allow).
-    const deadline = _callScope.getStore()?.deadline;
-    if (err?.name === 'TimeoutError' && deadline != null && deadline - Date.now() < 50) return INIT_BUDGET_CUT;
+    if (isBudgetCut(err)) return INIT_BUDGET_CUT;
     _ampReachable = false;
     return null;
   }
@@ -639,6 +663,7 @@ async function pollHitlDecision(callerId, { signal, boundWorkitemId, actionId, d
       data = await fetchDecisionBody(apiKey, callerId, actionId, signal, deadline);
     } catch (err) {
       if (!isRequestTimeout(err, signal)) throw err;
+      if (isBudgetCut(err, signal)) break; // the call's deadline: no time left for another poll
       console.warn('[AMP Governance] get-decision timed out, retrying...');
       data = null; // transient: keep polling until the deadline
     }
@@ -758,7 +783,7 @@ async function requestAndAwaitDecision(instanceId, tool, params, { signal, actio
       return { block: true, blockReason: `Tool call "${tool}" blocked — run cancelled before AMP answered the policy check.` };
     }
     // Cut by this call's own deadline (not the per-request cap): a budget miss, not an outage.
-    if (isRequestTimeout(err, signal) && deadline != null && deadline - Date.now() < 50) {
+    if (isBudgetCut(err, signal)) {
       const msg = budgetExhaustedMessage(tool);
       console.error(`[AMP Governance] ${msg}`);
       return { block: true, blockReason: msg };
