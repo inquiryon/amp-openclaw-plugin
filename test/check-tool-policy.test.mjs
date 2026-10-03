@@ -1,6 +1,7 @@
 // Tier 1: before_tool_call governance decisions against the in-process stub.
 // Covers spec items A1 (fail closed on policy_error/unknown/null bodies),
-// A2 (block modify until params can be applied) and A3 (honour poll interval).
+// A2 (block modify until params can be applied), A3 (honour poll interval)
+// and A4 (fail fast when AMP rejects a decision poll).
 //
 // The default test config polls every 50 ms (HITL_POLL_INTERVAL_MS) inside a
 // 3 s HITL window (HITL_TIMEOUT_MINUTES 0.05).
@@ -156,6 +157,44 @@ describe('checkToolPolicy — A1/A2 behaviour', () => {
       assert.match(res.blockReason, /use a safer command/);
     }));
   }
+});
+
+describe('pollHitlDecision — A4 fail fast on rejected polls', () => {
+  const approve = { status: 200, body: { status: 'complete', resolution: 'approve', workitem_id: 'wi-1' } };
+
+  for (const code of [401, 403, 404, 429]) {
+    test(`poll ${code} blocks fast`, (t) => withPlugin(t, 'hitl_approve', async (p) => {
+      p.stub.script('GET /api/hitl/get-decision', [{ status: code, body: { error: `stub ${code}` } }]);
+      const res = await p.callTool('exec', { command: 'echo hi' });
+      assert.equal(res?.block, true);
+      assert.match(res.blockReason, new RegExp(`HTTP ${code}`));
+      assert.doesNotMatch(res.blockReason, /timed out/);
+      assert.equal(p.stub.count(...DECISION), 1);
+    }));
+  }
+
+  test('poll 500 keeps polling', (t) => withPlugin(t, 'hitl_approve', async (p) => {
+    p.stub.script('GET /api/hitl/get-decision', [
+      { status: 500, body: { error: 'boom' } },
+      { status: 500, body: { error: 'boom' } },
+      approve,
+    ]);
+    const res = await p.callTool('exec', { command: 'echo hi' });
+    assert.deepEqual(res, {});
+    assert.equal(p.stub.count(...DECISION), 3);
+  }));
+
+  test('invalid JSON / non-object poll bodies keep polling', (t) => withPlugin(t, 'hitl_approve', async (p) => {
+    p.stub.script('GET /api/hitl/get-decision', [
+      { status: 200, raw: 'not json' },
+      { status: 200, raw: 'null' },
+      { status: 200, raw: '[{"status":"complete","resolution":"approve"}]' },
+      approve,
+    ]);
+    const res = await p.callTool('exec', { command: 'echo hi' });
+    assert.deepEqual(res, {});
+    assert.equal(p.stub.count(...DECISION), 4);
+  }));
 });
 
 // Every named stub mode with its expected outcome. todo = the item that makes it true.

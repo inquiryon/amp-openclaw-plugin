@@ -394,8 +394,20 @@ function sleep(ms, signal) {
   });
 }
 
+// Poll statuses that will not change by retrying (auth, unknown route, call limit).
+const POLL_FATAL_STATUS = new Set([401, 403, 404, 429]);
+
+class PollFatalError extends Error {
+  constructor(status, body) {
+    super(`get-decision returned HTTP ${status}`);
+    this.status = status;
+    this.body = String(body || '').slice(0, 200);
+  }
+}
+
 /**
  * Poll /api/hitl/get-decision until we get a 'complete' status or time out.
+ * Throws PollFatalError on HTTP 401/403/404/429; other failures keep polling.
  * Rejects as soon as `signal` aborts (run cancelled).
  */
 async function pollHitlDecision(callerId, { signal } = {}) {
@@ -407,11 +419,18 @@ async function pollHitlDecision(callerId, { signal } = {}) {
       `${buildAmpUrl('/api/hitl/get-decision')}?caller_id=${encodeURIComponent(callerId)}`,
       { headers: { 'X-API-Key': apiKey }, signal }
     );
+    if (POLL_FATAL_STATUS.has(res.status)) {
+      throw new PollFatalError(res.status, await res.text().catch(() => ''));
+    }
     if (!res.ok) {
       console.warn(`[AMP Governance] get-decision returned ${res.status}, retrying...`);
       continue;
     }
-    const data = await res.json();
+    const data = await res.json().catch(() => null);
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      console.warn('[AMP Governance] get-decision returned a non-object body, retrying...');
+      continue;
+    }
     if (data.status === 'complete') return data;
     console.log(`[AMP Governance] Waiting for human decision... (${data.status})`);
   }
@@ -490,6 +509,13 @@ async function checkToolPolicy(instanceId, tool, params, { signal } = {}) {
       if (signal?.aborted) {
         const msg = `Tool call "${tool}" blocked — run cancelled while waiting for AMP review.`;
         await ampLog(instanceId, msg, 'WARN');
+        return { block: true, blockReason: msg };
+      }
+      if (err instanceof PollFatalError) {
+        const msg = `Tool call "${tool}" blocked — AMP rejected the HITL decision poll (HTTP ${err.status}).`;
+        console.error(`[AMP Governance] ${msg} ${err.body}`);
+        await ampLog(instanceId, `${msg} ${err.body}`, 'ERROR');
+        notifyUser(_lastSender, `AMP rejected the review check for "${tool}" (HTTP ${err.status}) — the call was blocked.`);
         return { block: true, blockReason: msg };
       }
       const msg = `Tool call "${tool}" timed out waiting for human approval — blocked.`;
