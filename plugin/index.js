@@ -316,8 +316,10 @@ function clearSession() {
  */
 /** ensureInstance() result when /api/agent/init was cut by the call's budget. */
 const INIT_BUDGET_CUT = Symbol('init-budget-cut');
+/** ensureInstance() result when the caller's run was cancelled during /api/agent/init. */
+const INIT_CANCELLED = Symbol('init-cancelled');
 
-async function ensureInstance() {
+async function ensureInstance(signal) {
   if (!config) return null;
 
   if (_instanceId) return _instanceId;
@@ -337,7 +339,7 @@ async function ensureInstance() {
         config:     { agent_mode: 'polling' },
         metadata:   { source: 'openclaw-amp-plugin', owner: config.AMP_USERNAME },
       }),
-      signal: requestSignal(undefined, _callScope.getStore()?.deadline),
+      signal: requestSignal(signal, _callScope.getStore()?.deadline),
     });
     if (!res.ok) {
       const bodyText = await res.text().catch(() => '');
@@ -359,6 +361,9 @@ async function ensureInstance() {
     let target = '';
     try { target = buildAmpUrl('/api/agent/init'); } catch (_) {}
     console.error(`[AMP Governance] ensureInstance failed: ${em}${ec ? ` | cause=${ec}` : ''}${target ? ` | url=${target}` : ''}`);
+    // Run cancelled (LOW5): not an outage. The backend may still create the
+    // instance; it is never used (never an allow).
+    if (signal?.aborted) return INIT_CANCELLED;
     // Cut by the call's own deadline (W2): a budget miss, not an outage. The backend may
     // still create the instance; a later duplicate is acceptable (never an allow).
     if (isBudgetCut(err)) return INIT_BUDGET_CUT;
@@ -856,6 +861,11 @@ async function lockMissBlock(tool, contended, signal) {
 
 /** Block when no instance could be resolved (not configured, init failed or budget cut). */
 async function noInstanceBlock(tool, instanceId) {
+  if (instanceId === INIT_CANCELLED) {
+    const msg = `Tool call "${tool}" blocked — run cancelled while creating the AMP instance.`;
+    console.warn(`[AMP Governance] ${msg}`);
+    return { block: true, blockReason: msg };
+  }
   if (instanceId === INIT_BUDGET_CUT) {
     const msg = budgetExhaustedMessage(tool);
     console.error(`[AMP Governance] ${msg}`);
@@ -874,8 +884,8 @@ async function noInstanceBlock(tool, instanceId) {
  * Returns {} to allow, or { block: true, blockReason } to block.
  */
 async function governedCall(tool, params, { signal, toolCallId, deadline }) {
-  const instanceId = await ensureInstance();
-  if (!instanceId || instanceId === INIT_BUDGET_CUT) return noInstanceBlock(tool, instanceId);
+  const instanceId = await ensureInstance(signal);
+  if (!instanceId || instanceId === INIT_BUDGET_CUT || instanceId === INIT_CANCELLED) return noInstanceBlock(tool, instanceId);
 
   const paramSummary = formatInput(tool, params);
   console.log(`[AMP Governance] before_tool_call: ${tool} | instance: ${instanceId}`);

@@ -384,3 +384,29 @@ describe('K2.3 — session_start finishes the AMP instance', () => {
     assert.equal(finished(p, 'inst-1').length, 1, 'inst-1 finished exactly once');
   });
 });
+
+// Gate-2 LOW5: /api/agent/init runs inside the process-wide lock; a cancelled
+// run must abort it at once instead of holding the lock up to the request cap.
+describe('K2.3 — a cancelled run aborts AMP instance creation', () => {
+  test('abort during /api/agent/init blocks as cancelled, no outage alert, lock freed', { timeout: 12_000 }, async (t) => {
+    const p = await setup(t, { config: { AMP_REQUEST_TIMEOUT_MS: 60_000 } });
+    await p.handlers.message_received({ from: 'slack:channel:C1' }, { channelId: 'slack' });
+    p.stub.script('POST /api/agent/init', [
+      { status: 200, body: { instance_id: 'inst-late', status: 'running' }, delayMs: 30_000 },
+      { status: 200, body: { instance_id: 'inst-2', status: 'running' } },
+    ]);
+    const ac = new AbortController();
+    const aP = p.callTool('exec', { command: 'one' }, { abortSignal: ac.signal });
+    await waitFor(() => inits(p) === 1, 'init sent');
+    ac.abort();
+    const a = await aP;
+    assert.equal(a?.block, true);
+    assert.match(a.blockReason, /run cancelled/);
+    assert.equal(p.stub.count('POST', '/api/hitl/request'), 0);
+    assert.deepEqual(await p.callTool('exec', { command: 'two' }), {});
+    assert.equal(requestsOf(p).at(-1).body.caller_id, 'inst-2');
+    await delay(100); // let fire-and-forget notifications settle
+    const notes = p.runtimeCalls.map((c) => String(c.args[1]));
+    assert.deepEqual(notes.filter((m) => /Unreachable|Restored/.test(m)), [], 'no outage / recovery notification');
+  });
+});
