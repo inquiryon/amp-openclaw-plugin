@@ -440,6 +440,9 @@ const POLL_FATAL_STATUS = new Set([401, 403, 404, 429]);
 /** A6: the correlated poll cannot be trusted (no echo, or no work item in time). */
 class ActionIdCorrelationError extends Error {}
 
+/** The call's HITL window ended without a decision for its work item. */
+class HitlTimeoutError extends Error {}
+
 class PollFatalError extends Error {
   constructor(status, body) {
     super(`get-decision returned HTTP ${status}`);
@@ -612,7 +615,7 @@ async function pollHitlDecision(callerId, { signal, boundWorkitemId, actionId, d
     }
     checkActionIdWatchdog(actionId, bound, started);
   }
-  throw new Error(`HITL decision timed out after ${HITL_TIMEOUT_MS / 60000} minutes`);
+  throw new HitlTimeoutError(`HITL decision timed out after ${HITL_TIMEOUT_MS / 60000} minutes`);
 }
 
 // ── PER-INSTANCE REVIEW LOCK (C10) ──────────────────────────────────────────
@@ -780,6 +783,14 @@ async function requestAndAwaitDecision(instanceId, tool, params, { signal, actio
         console.error(`[AMP Governance] ${msg} ${err.body}`);
         await ampLog(instanceId, `${msg} ${err.body}`, 'ERROR');
         notifyUser(_lastSender, `AMP rejected the review check for "${tool}" (HTTP ${err.status}) — the call was blocked.`);
+        return { block: true, blockReason: msg };
+      }
+      if (!(err instanceof HitlTimeoutError)) {
+        // Network failure (not our request timeout): AMP is unreachable, not the reviewer slow.
+        const em = err && err.message ? err.message : String(err);
+        const msg = `Tool call "${tool}" blocked — AMP became unreachable while waiting for the AMP review (${em}).`;
+        console.error(`[AMP Governance] ${msg}`);
+        await ampLog(instanceId, msg, 'ERROR');
         return { block: true, blockReason: msg };
       }
       const msg = `Tool call "${tool}" timed out waiting for human approval — blocked.`;

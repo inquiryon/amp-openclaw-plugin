@@ -184,6 +184,15 @@ describe('pollHitlDecision — A4 fail fast on rejected polls', () => {
     assert.equal(p.stub.count(...DECISION), 3);
   }));
 
+  test('network error while polling blocks as unreachable, not as a timeout', (t) => withPlugin(t, 'hitl_approve', async (p) => {
+    p.stub.script('GET /api/hitl/get-decision', [{ destroy: true }]);
+    const res = await p.callTool('exec', { command: 'echo hi' });
+    assert.equal(res.block, true);
+    assert.match(res.blockReason, /unreachable while waiting for the AMP review/);
+    assert.doesNotMatch(res.blockReason, /timed out/);
+    assert.equal(p.stub.count(...DECISION), 1);
+  }));
+
   test('invalid JSON / non-object poll bodies keep polling', (t) => withPlugin(t, 'hitl_approve', async (p) => {
     p.stub.script('GET /api/hitl/get-decision', [
       { status: 200, raw: 'not json' },
