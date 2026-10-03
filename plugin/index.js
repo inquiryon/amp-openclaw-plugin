@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
+import { randomUUID } from 'node:crypto';
 import { normalizeTool } from './toolNormalization.js';
 
 console.log('[AMP Governance] Plugin module loaded — Phase 4.');
@@ -67,6 +68,10 @@ const HITL_POLL_INTERVAL_MS = positiveNumber(config?.HITL_POLL_INTERVAL_MS, 3000
 // Requested before_tool_call budget: the HITL window plus slack for the
 // request/log round-trips. An operator override in openclaw.json wins.
 const HOOK_TIMEOUT_MS = HITL_TIMEOUT_MS + 30_000;
+// A6/K3: send action_id on request + poll only when explicitly enabled (strict true).
+const ACTION_ID_CORRELATION = config?.ACTION_ID_CORRELATION === true;
+// Block if no work item appears for this action_id within this window (default 60 s).
+const ACTION_ID_WATCHDOG_MS = positiveNumber(config?.ACTION_ID_WATCHDOG_SECONDS, 60) * 1000;
 
 // Module-level instance cache so we only init once per process lifetime
 let _instanceId = null;
@@ -348,7 +353,7 @@ class InvalidAmpResponseError extends Error {}
  * Call /api/hitl/request with the tool call details.
  * The AMP backend eval engine decides allow vs HITL.
  */
-async function requestHitlEval(instanceId, tool, params) {
+async function requestHitlEval(instanceId, tool, params, actionId) {
   const apiKey = getAmpApiKey();
   const { tool: normTool, action: normAction } = normalizeTool(tool, params);
   const res = await fetch(buildAmpUrl('/api/hitl/request'), {
@@ -362,6 +367,7 @@ async function requestHitlEval(instanceId, tool, params) {
       tool:       normTool,
       action:     normAction,
       context:    params || {},
+      ...(actionId ? { action_id: actionId } : {}),
       hitl: {
         enable: true,
         when:   'policy',
@@ -396,6 +402,9 @@ function sleep(ms, signal) {
 
 // Poll statuses that will not change by retrying (auth, unknown route, call limit).
 const POLL_FATAL_STATUS = new Set([401, 403, 404, 429]);
+
+/** A6: the correlated poll cannot be trusted (no echo, or no work item in time). */
+class ActionIdCorrelationError extends Error {}
 
 class PollFatalError extends Error {
   constructor(status, body) {
@@ -458,9 +467,10 @@ function classifyDecision(data, bound, seen) {
 }
 
 /** One get-decision round-trip: parsed object body, or null to retry. */
-async function fetchDecisionBody(apiKey, callerId, signal) {
+async function fetchDecisionBody(apiKey, callerId, actionId, signal) {
+  const actionQuery = actionId ? `&action_id=${encodeURIComponent(actionId)}` : '';
   const res = await fetch(
-    `${buildAmpUrl('/api/hitl/get-decision')}?caller_id=${encodeURIComponent(callerId)}`,
+    `${buildAmpUrl('/api/hitl/get-decision')}?caller_id=${encodeURIComponent(callerId)}${actionQuery}`,
     { headers: { 'X-API-Key': apiKey }, signal }
   );
   if (POLL_FATAL_STATUS.has(res.status)) {
@@ -479,6 +489,27 @@ async function fetchDecisionBody(apiKey, callerId, signal) {
 }
 
 /**
+ * A6: with correlation on, a terminal body must echo our action_id. A missing
+ * or different echo means the backend ignored the scope — block, never fall
+ * back to an unscoped decision.
+ */
+function checkActionIdEcho(data, actionId) {
+  const terminal = data.status === 'complete' || isCancelledDecision(data);
+  if (actionId && terminal && data.action_id !== actionId) {
+    throw new ActionIdCorrelationError('AMP did not echo action_id — decision correlation unsupported; blocked.');
+  }
+}
+
+/** A6: no work item bound for this action_id within the watchdog window — block. */
+function checkActionIdWatchdog(actionId, bound, started) {
+  if (actionId && !bound && Date.now() - started >= ACTION_ID_WATCHDOG_MS) {
+    throw new ActionIdCorrelationError(
+      `AMP has not created a review for this action after ${ACTION_ID_WATCHDOG_MS / 1000}s (action_id correlation may be unsupported by the HITL service); blocked.`
+    );
+  }
+}
+
+/**
  * Poll /api/hitl/get-decision until this call's work item is complete (or
  * cancelled) or the HITL window ends. Binds to `boundWorkitemId`, else to the
  * first unseen workitem_id in a pending body (see classifyDecision).
@@ -486,16 +517,18 @@ async function fetchDecisionBody(apiKey, callerId, signal) {
  * Rejects as soon as `signal` aborts (run cancelled). A bound id stays in the
  * instance set on every exit, so an abandoned work item is never accepted later.
  */
-async function pollHitlDecision(callerId, { signal, boundWorkitemId } = {}) {
+async function pollHitlDecision(callerId, { signal, boundWorkitemId, actionId } = {}) {
   const apiKey = getAmpApiKey();
   const seen = seenWorkitemsFor(callerId);
   let bound = nonEmptyId(boundWorkitemId);
   let warnedOther = false;
-  const deadline = Date.now() + HITL_TIMEOUT_MS;
+  const started = Date.now();
+  const deadline = started + HITL_TIMEOUT_MS;
   while (Date.now() < deadline) {
     await sleep(HITL_POLL_INTERVAL_MS, signal);
-    const data = await fetchDecisionBody(apiKey, callerId, signal);
-    if (!data) continue;
+    const data = await fetchDecisionBody(apiKey, callerId, actionId, signal);
+    if (!data) { checkActionIdWatchdog(actionId, bound, started); continue; }
+    checkActionIdEcho(data, actionId);
     // Bind synchronously with the check so a concurrent call cannot take the id.
     const verdict = classifyDecision(data, bound, seen);
     if (verdict.bind) {
@@ -511,6 +544,7 @@ async function pollHitlDecision(callerId, { signal, boundWorkitemId } = {}) {
     } else if (verdict.action === 'wait') {
       console.log(`[AMP Governance] Waiting for human decision... (${data.status})`);
     }
+    checkActionIdWatchdog(actionId, bound, started);
   }
   throw new Error(`HITL decision timed out after ${HITL_TIMEOUT_MS / 60000} minutes`);
 }
@@ -521,13 +555,13 @@ async function pollHitlDecision(callerId, { signal, boundWorkitemId } = {}) {
  * Fails closed on unreachable AMP, non-2xx, no_policy, policy_error,
  * unknown status, and poll timeout.
  */
-async function checkToolPolicy(instanceId, tool, params, { signal } = {}) {
+async function checkToolPolicy(instanceId, tool, params, { signal, actionId } = {}) {
   const paramSummary = formatInput(tool, params);
   await ampLog(instanceId, `Policy check: ${tool} | ${paramSummary}`);
 
   let hitlResponse;
   try {
-    hitlResponse = await requestHitlEval(instanceId, tool, params);
+    hitlResponse = await requestHitlEval(instanceId, tool, params, actionId);
     // Successful contact with AMP — clear any prior down state
     await notifyAmpRecovered();
   } catch (err) {
@@ -584,11 +618,18 @@ async function checkToolPolicy(instanceId, tool, params, { signal } = {}) {
 
     let decision;
     try {
-      decision = await pollHitlDecision(instanceId, { signal, boundWorkitemId });
+      decision = await pollHitlDecision(instanceId, { signal, boundWorkitemId, actionId });
     } catch (err) {
       if (signal?.aborted) {
         const msg = `Tool call "${tool}" blocked — run cancelled while waiting for AMP review.`;
         await ampLog(instanceId, msg, 'WARN');
+        return { block: true, blockReason: msg };
+      }
+      if (err instanceof ActionIdCorrelationError) {
+        const msg = `Tool call "${tool}" blocked — ${err.message}`;
+        console.error(`[AMP Governance] ${msg}`);
+        await ampLog(instanceId, msg, 'ERROR');
+        notifyUser(_lastSender, `AMP could not correlate the review for "${tool}" — the call was blocked.`);
         return { block: true, blockReason: msg };
       }
       if (err instanceof PollFatalError) {
@@ -831,7 +872,8 @@ export default {
       await ampLog(instanceId, message);
 
       // Governance check — returns {} to allow or { block, blockReason } to block
-      return await checkToolPolicy(instanceId, tool, event.params, { signal: ctx?.abortSignal });
+      const actionId = ACTION_ID_CORRELATION ? (event.toolCallId || randomUUID()) : null;
+      return await checkToolPolicy(instanceId, tool, event.params, { signal: ctx?.abortSignal, actionId });
     }, { timeoutMs: HOOK_TIMEOUT_MS });
 
     // ── AFTER TOOL CALL: result logging ──────────────────────────────────────
