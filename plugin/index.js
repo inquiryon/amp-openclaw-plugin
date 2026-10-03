@@ -418,34 +418,99 @@ function isCancelledDecision(data) {
     || wiStatus === 'cancelled' || wiStatus === 'canceled';
 }
 
+// ── WORK-ITEM BINDING (K2 / H3 / L16) ───────────────────────────────────────
+// get-decision is instance-scoped and returns the newest resolved work item, so
+// a call can receive another call's decision. Each instance keeps the ids that
+// any call has already bound, consumed or abandoned; a call accepts only the
+// decision for the work item it is bound to.
+const SEEN_WORKITEMS_CAP = 500;
+const _seenWorkitems = new Map(); // instanceId -> Set<workitem_id>
+
+function seenWorkitemsFor(instanceId) {
+  if (!_seenWorkitems.has(instanceId)) _seenWorkitems.set(instanceId, new Set());
+  return _seenWorkitems.get(instanceId);
+}
+
+/** Records a work item id (most recent last); drops the oldest past the cap. */
+function rememberWorkitem(seen, workitemId) {
+  seen.delete(workitemId);
+  seen.add(workitemId);
+  while (seen.size > SEEN_WORKITEMS_CAP) seen.delete(seen.values().next().value);
+}
+
+const nonEmptyId = (v) => (typeof v === 'string' && v !== '' ? v : null);
+
 /**
- * Poll /api/hitl/get-decision until we get a 'complete' (or cancelled) body or time out.
- * Throws PollFatalError on HTTP 401/403/404/429; other failures keep polling.
- * Rejects as soon as `signal` aborts (run cancelled).
+ * Pure verdict for one get-decision body. Returns { action, bind? } where
+ * action is 'accept' (terminal, ours), 'ignore' (terminal, not provably ours)
+ * or 'wait' (not terminal); bind = id this call should bind to now.
  */
-async function pollHitlDecision(callerId, { signal } = {}) {
+function classifyDecision(data, bound, seen) {
+  const id = nonEmptyId(data.workitem_id);
+  const terminal = data.status === 'complete' || isCancelledDecision(data);
+  if (!terminal) return !bound && id && !seen.has(id) ? { action: 'wait', bind: id } : { action: 'wait' };
+  if (bound) return { action: id === bound ? 'accept' : 'ignore' };
+  if (id) return seen.has(id) ? { action: 'ignore' } : { action: 'accept', bind: id };
+  // Unbound and the body carries no workitem_id: unverifiable. Keep the legacy
+  // accept only while this instance has never seen a work item (nothing it
+  // could be confused with); otherwise keep polling. (Lead question.)
+  return { action: seen.size === 0 ? 'accept' : 'ignore' };
+}
+
+/** One get-decision round-trip: parsed object body, or null to retry. */
+async function fetchDecisionBody(apiKey, callerId, signal) {
+  const res = await fetch(
+    `${buildAmpUrl('/api/hitl/get-decision')}?caller_id=${encodeURIComponent(callerId)}`,
+    { headers: { 'X-API-Key': apiKey }, signal }
+  );
+  if (POLL_FATAL_STATUS.has(res.status)) {
+    throw new PollFatalError(res.status, await res.text().catch(() => ''));
+  }
+  if (!res.ok) {
+    console.warn(`[AMP Governance] get-decision returned ${res.status}, retrying...`);
+    return null;
+  }
+  const data = await res.json().catch(() => null);
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    console.warn('[AMP Governance] get-decision returned a non-object body, retrying...');
+    return null;
+  }
+  return data;
+}
+
+/**
+ * Poll /api/hitl/get-decision until this call's work item is complete (or
+ * cancelled) or the HITL window ends. Binds to `boundWorkitemId`, else to the
+ * first unseen workitem_id in a pending body (see classifyDecision).
+ * Throws PollFatalError on HTTP 401/403/404/429; other failures keep polling.
+ * Rejects as soon as `signal` aborts (run cancelled). A bound id stays in the
+ * instance set on every exit, so an abandoned work item is never accepted later.
+ */
+async function pollHitlDecision(callerId, { signal, boundWorkitemId } = {}) {
   const apiKey = getAmpApiKey();
+  const seen = seenWorkitemsFor(callerId);
+  let bound = nonEmptyId(boundWorkitemId);
+  let warnedOther = false;
   const deadline = Date.now() + HITL_TIMEOUT_MS;
   while (Date.now() < deadline) {
     await sleep(HITL_POLL_INTERVAL_MS, signal);
-    const res = await fetch(
-      `${buildAmpUrl('/api/hitl/get-decision')}?caller_id=${encodeURIComponent(callerId)}`,
-      { headers: { 'X-API-Key': apiKey }, signal }
-    );
-    if (POLL_FATAL_STATUS.has(res.status)) {
-      throw new PollFatalError(res.status, await res.text().catch(() => ''));
+    const data = await fetchDecisionBody(apiKey, callerId, signal);
+    if (!data) continue;
+    // Bind synchronously with the check so a concurrent call cannot take the id.
+    const verdict = classifyDecision(data, bound, seen);
+    if (verdict.bind) {
+      rememberWorkitem(seen, verdict.bind);
+      bound = verdict.bind;
     }
-    if (!res.ok) {
-      console.warn(`[AMP Governance] get-decision returned ${res.status}, retrying...`);
-      continue;
+    if (verdict.action === 'accept') return data;
+    if (verdict.action === 'ignore' && !warnedOther) {
+      warnedOther = true;
+      const msg = `HITL: ignoring decision for other workitem ${data.workitem_id || '(none)'} — waiting for ${bound || 'own workitem'}`;
+      console.warn(`[AMP Governance] ${msg}`);
+      await ampLog(callerId, msg, 'WARN');
+    } else if (verdict.action === 'wait') {
+      console.log(`[AMP Governance] Waiting for human decision... (${data.status})`);
     }
-    const data = await res.json().catch(() => null);
-    if (!data || typeof data !== 'object' || Array.isArray(data)) {
-      console.warn('[AMP Governance] get-decision returned a non-object body, retrying...');
-      continue;
-    }
-    if (data.status === 'complete' || isCancelledDecision(data)) return data;
-    console.log(`[AMP Governance] Waiting for human decision... (${data.status})`);
   }
   throw new Error(`HITL decision timed out after ${HITL_TIMEOUT_MS / 60000} minutes`);
 }
@@ -479,6 +544,9 @@ async function checkToolPolicy(instanceId, tool, params, { signal } = {}) {
 
   // Never dereference hitlResponse directly: null / array / scalar bodies fail closed below.
   const body = hitlResponse && typeof hitlResponse === 'object' && !Array.isArray(hitlResponse) ? hitlResponse : {};
+  // K2: bind to the request's work item at once, before any await.
+  const boundWorkitemId = nonEmptyId(body.workitem_id);
+  if (boundWorkitemId) rememberWorkitem(seenWorkitemsFor(instanceId), boundWorkitemId);
   const status = typeof body.status === 'string' ? body.status : '';
   const rawReason = body.reason || body.information || '';
   const reason = typeof rawReason === 'string' ? rawReason : JSON.stringify(rawReason);
@@ -507,8 +575,7 @@ async function checkToolPolicy(instanceId, tool, params, { signal } = {}) {
   }
 
   // ── HITL required — wait for human decision ──────────────────────────────
-  const hasWorkitem = typeof body.workitem_id === 'string' && body.workitem_id !== '';
-  if (status === 'pending' || status === 'waiting-for-response' || hasWorkitem) {
+  if (status === 'pending' || status === 'waiting-for-response' || boundWorkitemId) {
     console.log(`[AMP Governance] HITL required for "${tool}" — waiting for human decision...`);
     await ampLog(instanceId, `HITL requested for tool: ${tool} — awaiting human approval in AMP`, 'WARN');
 
@@ -517,7 +584,7 @@ async function checkToolPolicy(instanceId, tool, params, { signal } = {}) {
 
     let decision;
     try {
-      decision = await pollHitlDecision(instanceId, { signal });
+      decision = await pollHitlDecision(instanceId, { signal, boundWorkitemId });
     } catch (err) {
       if (signal?.aborted) {
         const msg = `Tool call "${tool}" blocked — run cancelled while waiting for AMP review.`;
