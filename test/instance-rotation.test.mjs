@@ -347,3 +347,40 @@ describe('K2.3 — a throw in the governance path retires and blocks', () => {
     });
   }
 });
+
+// Gate-2 LOW4: session_start (/new, /reset) drops the instance; it must also
+// finish it in AMP, without interrupting a call still running on it.
+describe('K2.3 — session_start finishes the AMP instance', () => {
+  test('session_start: setState finished for the old instance; the next call inits a fresh one', async (t) => {
+    const p = await setup(t);
+    assert.deepEqual(await p.callTool('exec', { command: 'one' }), {});
+    p.handlers.session_start({}, {});
+    await waitFor(() => finished(p, 'inst-1').length === 1, 'setState finished for inst-1');
+    assert.deepEqual(await p.callTool('exec', { command: 'two' }), {});
+    assert.deepEqual(requestsOf(p).map((r) => r.body.caller_id), ['inst-1', 'inst-2']);
+  });
+
+  test('session_start with no instance yet sends no setState', async (t) => {
+    const p = await setup(t);
+    p.handlers.session_start({}, {});
+    await delay(50);
+    assert.equal(p.stub.count('POST', '/api/agent/setState'), 0);
+  });
+
+  test('a call in flight keeps its instance; its own retire does not finish it twice', async (t) => {
+    const p = await setup(t);
+    p.stub.script('POST /api/hitl/request', [pending(null), ok({ status: 'no-hitl' })]);
+    scopeDecisions(p, () => pending(null));
+    const aP = p.callTool('exec', { command: 'one' });
+    await waitFor(() => p.stub.count('GET', '/api/hitl/get-decision') >= 1, 'A polling');
+    p.handlers.session_start({}, {});
+    const pollsAtReset = p.stub.count('GET', '/api/hitl/get-decision');
+    assert.match((await aP).blockReason, /timed out/);
+    assert.ok(p.stub.count('GET', '/api/hitl/get-decision') > pollsAtReset, 'A kept polling after session_start');
+    assert.ok(pollCallers(p).every((c) => c === 'inst-1'));
+    assert.deepEqual(await p.callTool('exec', { command: 'two' }), {});
+    assert.equal(requestsOf(p).at(-1).body.caller_id, 'inst-2');
+    await delay(100); // let fire-and-forget setState calls land
+    assert.equal(finished(p, 'inst-1').length, 1, 'inst-1 finished exactly once');
+  });
+});

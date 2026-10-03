@@ -779,12 +779,22 @@ function finishInstance(instanceId) {
     .catch((err) => console.warn(`[AMP Governance] setState finished for ${instanceId} failed: ${err?.message || err}`));
 }
 
-/** Drops `instanceId` as this process's instance and finishes it in AMP (fire-and-forget). */
-function retireInstance(instanceId) {
+// Instances already retired by this process; retiring one again is a no-op.
+const _retiredInstances = new Set();
+
+/**
+ * Drops `instanceId` as this process's instance and finishes it in AMP
+ * (fire-and-forget). Idempotent: a call still running on an instance that
+ * session_start retired can retire it again without a second setState.
+ */
+function retireInstance(instanceId, why = 'the call ended without a decision for its review') {
+  if (!instanceId) return;
   if (_instanceId === instanceId) _instanceId = null;
   if (readSession()?.instanceId === instanceId) clearSession();
+  if (_retiredInstances.has(instanceId)) return;
+  _retiredInstances.add(instanceId);
   _seenWorkitems.delete(instanceId);
-  console.warn(`[AMP Governance] Retiring AMP instance ${instanceId}: the call ended without a decision for its review; the next call starts a fresh instance.`);
+  console.warn(`[AMP Governance] Retiring AMP instance ${instanceId}: ${why}; the next call starts a fresh instance.`);
   finishInstance(instanceId);
 }
 
@@ -1311,7 +1321,9 @@ export default {
     // ── SESSION RESET: clear instance cache on /new or /reset ────────────────
     api.on('session_start', () => {
       console.log('[AMP Governance] Session started — clearing instance cache.');
-      _instanceId = null;
+      // Finish the old instance too (fire-and-forget); a call still running on
+      // it keeps its own id and is not interrupted.
+      retireInstance(_instanceId, 'session started');
       clearSession();
     });
 
