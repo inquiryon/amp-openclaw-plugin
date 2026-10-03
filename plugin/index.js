@@ -287,25 +287,33 @@ async function ampLog(instanceId, message, level = 'INFO') {
 // ── PROACTIVE NOTIFICATIONS ──────────────────────────────────────────────────
 
 /**
- * Send a proactive WhatsApp message to the user without waiting for the agent
- * to finish. Uses the openclaw CLI so we don't need to reverse-engineer the
- * gateway REST API.  Fire-and-forget — errors are logged but never thrown.
+ * Send a proactive message to the sender's channel via the runtime outbound
+ * adapter. Fire-and-forget — errors are logged but never thrown.
  */
 async function notifyUser(sender, message) {
   if (!sender?.from || !_runtime) return;
   const prefixed = `[AMP]\n${message}`;
+  const channelId = sender.channelId || (sender.from.startsWith('slack:') ? 'slack' : 'whatsapp');
+  // 'slack:channel:C1' -> 'channel:C1': channel senders expect the bare target.
+  const to = sender.from.startsWith(`${channelId}:`) ? sender.from.slice(channelId.length + 1) : sender.from;
   console.log(`[AMP Governance] Sending notification to ${sender.from}: ${message}`);
   try {
-    const channelId = sender.channelId || '';
-    if (channelId === 'slack' || sender.from.startsWith('slack:')) {
-      // Strip the 'slack:' prefix — sendMessageSlack expects 'channel:<id>' or 'user:<id>', not 'slack:channel:<id>'
-      const slackTarget = sender.from.startsWith('slack:') ? sender.from.slice('slack:'.length) : sender.from;
-      await _runtime.channel.slack.sendMessageSlack(slackTarget, prefixed);
-    } else {
-      await _runtime.channel.whatsapp.sendMessageWhatsApp(sender.from, prefixed, { verbose: false });
+    const outbound = _runtime.channel?.outbound;
+    if (typeof outbound?.loadAdapter === 'function') {
+      // OpenClaw >= 2026.9 (api.runtime.channel.outbound). sendText argument shape
+      // unverified against a live gateway (R7) — NEEDS-LIVE.
+      const adapter = await outbound.loadAdapter(channelId);
+      if (typeof adapter?.sendText !== 'function') {
+        throw new Error(`no outbound sendText for channel "${channelId}"`);
+      }
+      await adapter.sendText({ cfg: _runtime.config?.current?.() ?? undefined, to, text: prefixed });
+      return;
     }
+    // Legacy runtimes (OpenClaw 2026.7): per-channel send helpers.
+    if (channelId === 'slack') await _runtime.channel.slack.sendMessageSlack(to, prefixed);
+    else await _runtime.channel.whatsapp.sendMessageWhatsApp(sender.from, prefixed, { verbose: false });
   } catch (err) {
-    console.warn('[AMP Governance] notifyUser failed:', err.message);
+    console.warn('[AMP Governance] notifyUser failed:', err?.message || String(err));
   }
 }
 
