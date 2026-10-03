@@ -1,7 +1,7 @@
 // Tier 1: before_tool_call governance decisions against the in-process stub.
 // Covers spec items A1 (fail closed on policy_error/unknown/null bodies),
 // A2 (block modify until params can be applied), A3 (honour poll interval)
-// and A4 (fail fast when AMP rejects a decision poll).
+// A4 (fail fast when AMP rejects a decision poll) and B2/K1 (cancelled is terminal).
 //
 // The default test config polls every 50 ms (HITL_POLL_INTERVAL_MS) inside a
 // 3 s HITL window (HITL_TIMEOUT_MINUTES 0.05).
@@ -194,6 +194,53 @@ describe('pollHitlDecision — A4 fail fast on rejected polls', () => {
     const res = await p.callTool('exec', { command: 'echo hi' });
     assert.deepEqual(res, {});
     assert.equal(p.stub.count(...DECISION), 4);
+  }));
+});
+
+describe('pollHitlDecision — B2/K1 cancelled work items are terminal', () => {
+  const ok = (body) => ({ status: 200, body });
+  const logs = (p) => p.stub.requests((r) => r.path === '/api/log').map((r) => r.body);
+
+  function assertCancelledBlock(p, res) {
+    assert.equal(res?.block, true);
+    assert.match(res.blockReason, /cancelled/i);
+    assert.doesNotMatch(res.blockReason, /rejected by/);
+    assert.ok(
+      logs(p).some((l) => l.level === 'WARN' && /cancelled/i.test(l.message)),
+      'expected a WARN ampLog mentioning cancelled',
+    );
+  }
+
+  test('hitl_cancelled mode blocks as cancelled, not rejected by a reviewer', (t) => withPlugin(t, 'hitl_cancelled', async (p) => {
+    const res = await p.callTool('exec', { command: 'echo hi' });
+    assertCancelledBlock(p, res);
+    assert.equal(p.stub.count(...DECISION), 1);
+  }));
+
+  const terminalBodies = {
+    'status cancelled (forward-compat)': { status: 'cancelled', workitem_id: 'wi-1' },
+    'complete + method cancelled': { status: 'complete', resolution: 'reject', method: 'cancelled', workitem_id: 'wi-1' },
+    'complete + workitem_status canceled': { status: 'complete', resolution: 'reject', workitem_status: 'canceled', workitem_id: 'wi-1' },
+    'pending + workitem_status Cancelled': { status: 'pending', workitem_status: 'Cancelled', workitem_id: 'wi-1' },
+  };
+  for (const [name, body] of Object.entries(terminalBodies)) {
+    test(`${name} blocks in one poll`, (t) => withPlugin(t, 'hitl_approve', async (p) => {
+      p.stub.script('GET /api/hitl/get-decision', [ok(body)]);
+      const res = await p.callTool('exec', { command: 'echo hi' });
+      assertCancelledBlock(p, res);
+      assert.equal(p.stub.count(...DECISION), 1);
+    }));
+  }
+
+  test('plain pending keeps polling', (t) => withPlugin(t, 'hitl_approve', async (p) => {
+    p.stub.script('GET /api/hitl/get-decision', [
+      ok({ status: 'pending', workitem_status: 'Pending', workitem_id: 'wi-1' }),
+      ok({ status: 'pending', workitem_id: 'wi-1' }),
+      ok({ status: 'complete', resolution: 'approve', workitem_id: 'wi-1' }),
+    ]);
+    const res = await p.callTool('exec', { command: 'echo hi' });
+    assert.deepEqual(res, {});
+    assert.equal(p.stub.count(...DECISION), 3);
   }));
 });
 

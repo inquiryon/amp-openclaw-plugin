@@ -406,7 +406,20 @@ class PollFatalError extends Error {
 }
 
 /**
- * Poll /api/hitl/get-decision until we get a 'complete' status or time out.
+ * True when a get-decision body says the work item was cancelled (K1/B2):
+ * forward-compat `status:'cancelled'`, backend `method:'cancelled'` on a
+ * complete body, or any body whose workitem_status reads cancelled/canceled.
+ * A cancellation is the absence of a decision — never report it as a reject.
+ */
+function isCancelledDecision(data) {
+  const wiStatus = String(data.workitem_status || '').toLowerCase().trim();
+  return data.status === 'cancelled'
+    || (data.status === 'complete' && data.method === 'cancelled')
+    || wiStatus === 'cancelled' || wiStatus === 'canceled';
+}
+
+/**
+ * Poll /api/hitl/get-decision until we get a 'complete' (or cancelled) body or time out.
  * Throws PollFatalError on HTTP 401/403/404/429; other failures keep polling.
  * Rejects as soon as `signal` aborts (run cancelled).
  */
@@ -431,7 +444,7 @@ async function pollHitlDecision(callerId, { signal } = {}) {
       console.warn('[AMP Governance] get-decision returned a non-object body, retrying...');
       continue;
     }
-    if (data.status === 'complete') return data;
+    if (data.status === 'complete' || isCancelledDecision(data)) return data;
     console.log(`[AMP Governance] Waiting for human decision... (${data.status})`);
   }
   throw new Error(`HITL decision timed out after ${HITL_TIMEOUT_MS / 60000} minutes`);
@@ -521,6 +534,13 @@ async function checkToolPolicy(instanceId, tool, params, { signal } = {}) {
       const msg = `Tool call "${tool}" timed out waiting for human approval — blocked.`;
       await ampLog(instanceId, msg, 'ERROR');
       notifyUser(_lastSender, `No response from the reviewer — "${tool}" was blocked due to timeout.`);
+      return { block: true, blockReason: msg };
+    }
+
+    if (isCancelledDecision(decision)) {
+      const msg = `Tool call "${tool}" blocked — the AMP review was cancelled before a decision was made.`;
+      await ampLog(instanceId, `HITL cancelled — blocked: ${tool} | workitem: ${decision.workitem_id}`, 'WARN');
+      notifyUser(_lastSender, `The review for "${tool}" was cancelled — the call was blocked.`);
       return { block: true, blockReason: msg };
     }
 
