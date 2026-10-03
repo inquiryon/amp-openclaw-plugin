@@ -54,6 +54,52 @@ test('no error and no budget cut when the override covers HITL + 30 s', async (t
   assert.match(res.blockReason, /timed out waiting for human approval/);
 });
 
+test('slow /api/log cannot carry the call past its hook budget', { timeout: 8_000 }, async (t) => {
+  // Every log write hangs 30 s. Unbounded (15 s cap each) the call would need > 45 s;
+  // bounded by the call budget it finishes well inside the 8 s test ceiling.
+  const p = await load(t, { apiConfig: override({ timeouts: { before_tool_call: 3000 } }) });
+  p.stub.setMode('hitl_slow', { pendingPolls: 1_000_000 });
+  p.stub.script('POST /api/log', [{ status: 200, body: { ok: true }, delayMs: 30_000 }]);
+  const res = await p.callTool('exec', { command: 'echo hi' });
+  assert.equal(res.block, true);
+});
+
+test('budget too small to start a request blocks without an AMP outage', async (t) => {
+  // override 400 -> budget 300 ms: below the 500 ms floor for /api/hitl/request.
+  const p = await load(t, { apiConfig: override({ timeouts: { before_tool_call: 400 } }), mode: 'allow' });
+  const res = await p.callTool('exec', { command: 'echo hi' });
+  assert.equal(res.block, true);
+  assert.match(res.blockReason, /OpenClaw hook budget/);
+  assert.doesNotMatch(res.blockReason, /did not answer|unreachable/);
+  assert.equal(p.stub.count('POST', '/api/hitl/request'), 0);
+});
+
+test('re-registering without the override restores the full HITL budget', async (t) => {
+  // HITL 3 s; override 2000 cuts it to 1.5 s. After re-registering without it: full 3 s window.
+  const p = await load(t, { apiConfig: override({ timeouts: { before_tool_call: 2000 } }), config: { HITL_TIMEOUT_MINUTES: 0.05 } });
+  p.reregister({ config: undefined });
+  p.stub.setMode('hitl_slow', { pendingPolls: 1_000_000 });
+  const res = await p.callTool('exec', { command: 'echo hi' });
+  assert.match(res.blockReason, /timed out waiting for human approval/);
+});
+
+for (const [name, hooks, budgetCut] of [
+  ['both keys: timeouts.before_tool_call wins over timeoutMs', { timeouts: { before_tool_call: 2000 }, timeoutMs: 600_000 }, true],
+  ['float override is floored and honoured', { timeouts: { before_tool_call: 2500.9 } }, true],
+  ['zero override is ignored', { timeouts: { before_tool_call: 0 } }, false],
+  ['Infinity override is ignored', { timeouts: { before_tool_call: Infinity } }, false],
+  ['string "2000" override is ignored', { timeouts: { before_tool_call: '2000' } }, false],
+  ['non-object hooks is ignored', 5, false],
+  ['non-object timeouts is ignored', { timeouts: 'x' }, false],
+]) {
+  test(`parsing: ${name}`, { timeout: 20_000 }, async (t) => {
+    const p = await load(t, { apiConfig: override(hooks), config: { HITL_TIMEOUT_MINUTES: 0.05 } });
+    p.stub.setMode('hitl_slow', { pendingPolls: 1_000_000 });
+    const res = await p.callTool('exec', { command: 'echo hi' });
+    assert.match(res.blockReason, budgetCut ? /OpenClaw hook budget/ : /timed out waiting for human approval/);
+  });
+}
+
 for (const [name, apiConfig] of [
   ['missing api.config', undefined],
   ['non-numeric override', override({ timeouts: { before_tool_call: 'abc' } })],

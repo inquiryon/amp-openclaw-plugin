@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
 import { randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { normalizeTool } from './toolNormalization.js';
 
 console.log('[AMP Governance] Plugin module loaded — Phase 4.');
@@ -79,6 +80,18 @@ const PLUGIN_ID = 'amp-governance';
 // returns its own block (and frees the instance slot) before the host does.
 let _callBudgetMs = HITL_TIMEOUT_MS;
 let _hookBudgetLimitMs = null; // operator before_tool_call timeout, when it binds
+// Deadline of the before_tool_call in progress, so log/init writes made on its
+// behalf never outlive its budget (they are best-effort; a cut write is dropped).
+const _callScope = new AsyncLocalStorage();
+const LOG_MIN_BUDGET_MS = 250;     // a block/audit log still gets this much after the deadline
+const MIN_REQUEST_BUDGET_MS = 500; // below this, /api/hitl/request is not started
+
+/** Block message when the call's own budget ran out. */
+function budgetExhaustedMessage(tool) {
+  return _hookBudgetLimitMs !== null
+    ? `Tool call "${tool}" blocked — the AMP review did not complete within the ${Math.round(_hookBudgetLimitMs / 1000)}s OpenClaw hook budget (plugins.entries.${PLUGIN_ID}.hooks.timeouts.before_tool_call). Raise it (max 600000) for longer reviews.`
+    : `Tool call "${tool}" timed out waiting for human approval — blocked.`;
+}
 
 /**
  * Operator override for before_tool_call from openclaw.json, with the host's
@@ -271,7 +284,7 @@ async function ensureInstance() {
         config:     { agent_mode: 'polling' },
         metadata:   { source: 'openclaw-amp-plugin', owner: config.AMP_USERNAME },
       }),
-      signal: requestSignal(),
+      signal: requestSignal(undefined, _callScope.getStore()?.deadline),
     });
     if (!res.ok) {
       const bodyText = await res.text().catch(() => '');
@@ -300,6 +313,14 @@ async function ensureInstance() {
 
 // ── AMP LOGGING ──────────────────────────────────────────────────────────────
 
+/** Timeout for a log write: the call's remaining budget (floor LOG_MIN_BUDGET_MS), capped at AMP_REQUEST_TIMEOUT_MS. */
+function logSignal() {
+  const deadline = _callScope.getStore()?.deadline;
+  const ms = deadline == null ? AMP_REQUEST_TIMEOUT_MS
+    : Math.min(AMP_REQUEST_TIMEOUT_MS, Math.max(LOG_MIN_BUDGET_MS, deadline - Date.now()));
+  return AbortSignal.timeout(Math.floor(ms));
+}
+
 async function ampLog(instanceId, message, level = 'INFO') {
   if (!config) return;
   try {
@@ -316,7 +337,7 @@ async function ampLog(instanceId, message, level = 'INFO') {
         org_id:      config.AMP_ORG_ID,
         username:    config.AMP_USERNAME,
       }),
-      signal: requestSignal(),
+      signal: logSignal(),
     });
   } catch (err) {
     console.error('[AMP Governance] ampLog failed:', err?.message || String(err));
@@ -705,6 +726,13 @@ async function checkToolPolicy(instanceId, tool, params, { signal, actionId, dea
 
 /** Request + HITL wait for one call; runs while holding the instance lock. */
 async function requestAndAwaitDecision(instanceId, tool, params, { signal, actionId, deadline }) {
+  // Too little budget left to get an answer: block as a budget miss, not as an AMP outage.
+  if (deadline != null && deadline - Date.now() < MIN_REQUEST_BUDGET_MS) {
+    const msg = budgetExhaustedMessage(tool);
+    console.error(`[AMP Governance] ${msg}`);
+    await ampLog(instanceId, msg, 'ERROR');
+    return { block: true, blockReason: msg };
+  }
   let hitlResponse;
   try {
     hitlResponse = await requestHitlEval(instanceId, tool, params, actionId, { signal, deadline });
@@ -814,9 +842,7 @@ async function requestAndAwaitDecision(instanceId, tool, params, { signal, actio
         notifyUser(_lastSender, `AMP became unreachable during the review for "${tool}" — the call was blocked.`);
         return { block: true, blockReason: msg };
       }
-      const msg = _hookBudgetLimitMs !== null
-        ? `Tool call "${tool}" blocked — the AMP review did not complete within the ${Math.round(_hookBudgetLimitMs / 1000)}s OpenClaw hook budget (plugins.entries.${PLUGIN_ID}.hooks.timeouts.before_tool_call). Raise it (max 600000) for longer reviews.`
-        : `Tool call "${tool}" timed out waiting for human approval — blocked.`;
+      const msg = budgetExhaustedMessage(tool);
       await ampLog(instanceId, msg, 'ERROR');
       notifyUser(_lastSender, `No response from the reviewer — "${tool}" was blocked due to timeout.`);
       return { block: true, blockReason: msg };
@@ -994,6 +1020,9 @@ export default {
     _runtime = api.runtime;
 
     // ── HOOK BUDGET: fit inside a shorter operator hook timeout (A3) ─────────
+    // Recomputed on every register() so a removed/raised override does not linger.
+    _callBudgetMs = HITL_TIMEOUT_MS;
+    _hookBudgetLimitMs = null;
     const override = operatorHookTimeoutMs(api.config);
     if (override !== null) {
       const margin = Math.min(5000, 0.25 * override);
@@ -1049,6 +1078,10 @@ export default {
     api.on('before_tool_call', async (event, ctx) => {
       // C10: one budget per call, shared by the lock wait and the HITL poll.
       const callDeadline = Date.now() + _callBudgetMs;
+      return _callScope.run({ deadline: callDeadline }, () => beforeToolCall(event, ctx, callDeadline));
+    }, { timeoutMs: HOOK_TIMEOUT_MS });
+
+    async function beforeToolCall(event, ctx, callDeadline) {
       const tool = event.toolName || event.name || 'unknown-tool';
       if (SKIP_TOOLS.has(tool)) return {};
 
@@ -1080,7 +1113,7 @@ export default {
       // Governance check — returns {} to allow or { block, blockReason } to block
       const actionId = ACTION_ID_CORRELATION ? (event.toolCallId || randomUUID()) : null;
       return await checkToolPolicy(instanceId, tool, event.params, { signal: ctx?.abortSignal, actionId, deadline: callDeadline });
-    }, { timeoutMs: HOOK_TIMEOUT_MS });
+    }
 
     // ── AFTER TOOL CALL: result logging ──────────────────────────────────────
     api.on('after_tool_call', async (event) => {

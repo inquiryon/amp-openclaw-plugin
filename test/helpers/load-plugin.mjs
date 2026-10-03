@@ -94,5 +94,8 @@ export async function loadPlugin(options = {}) {
     if (ownStub) await stub.close();
   };
 
-  return { handlers, opts, stub, stateDir, config, runtimeCalls, loggerErrors, callTool, cleanup };
+  // Register the same module instance again (config reload); later api.on calls replace handlers.
+  const reregister = (apiOverrides = {}) => mod.register({ ...fakeApi, ...apiOverrides });
+
+  return { handlers, opts, stub, stateDir, config, runtimeCalls, loggerErrors, callTool, reregister, cleanup };
 }
