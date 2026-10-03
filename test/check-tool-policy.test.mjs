@@ -47,10 +47,11 @@ describe('checkToolPolicy — current behaviour', () => {
     assert.equal(p.stub.count(...DECISION), 0);
   }));
 
-  test('policy_error (HTTP 500) blocks', (t) => withPlugin(t, 'policy_error', async (p) => {
+  test('policy_error (HTTP 500) blocks, labelled as an AMP HTTP 500 (Wave 3 Note A)', (t) => withPlugin(t, 'policy_error', async (p) => {
     const res = await p.callTool('exec', { command: 'echo hi' });
     assert.equal(res.block, true);
-    assert.match(res.blockReason, /unreachable/);
+    assert.match(res.blockReason, /AMP returned HTTP 500 for the policy check/);
+    assert.doesNotMatch(res.blockReason, /unreachable/);
   }));
 
   test('backend down blocks', (t) => withPlugin(t, 'down', async (p) => {
@@ -185,13 +186,26 @@ describe('LOW2 — request-side HTTP 4xx is a rejection, not an outage', () => {
     }));
   }
 
-  test('request 5xx keeps the outage path', (t) => withPlugin(t, 'allow', async (p) => {
+  test('request 5xx blocks as an AMP server error, with no outage alert (Wave 3 Note A)', (t) => withPlugin(t, 'allow', async (p) => {
     await p.handlers.message_received({ from: 'slack:channel:C1' }, { channelId: 'slack' });
-    p.stub.script('POST /api/hitl/request', [{ status: 502, body: {} }]);
+    p.stub.script('POST /api/hitl/request', [{ status: 502, body: {} }, { status: 200, body: { status: 'no-hitl' } }]);
+    const res = await p.callTool('exec', { command: 'echo hi' });
+    assert.equal(res.block, true);
+    assert.match(res.blockReason, /AMP returned HTTP 502 for the policy check/);
+    await new Promise((r) => setTimeout(r, 200));
+    assert.deepEqual(p.runtimeCalls.filter((c) => /Unreachable/.test(JSON.stringify(c))), [], 'no outage alert for an HTTP answer');
+    // The request may have reached agent-hitl: the instance is retired (K2.3).
+    assert.deepEqual(await p.callTool('exec', { command: 'again' }), {});
+    assert.equal(p.stub.count('POST', '/api/agent/init'), 2);
+  }));
+
+  test('transport failure on the request keeps the outage path', (t) => withPlugin(t, 'allow', async (p) => {
+    await p.handlers.message_received({ from: 'slack:channel:C1' }, { channelId: 'slack' });
+    p.stub.script('POST /api/hitl/request', [{ destroy: true }]);
     const res = await p.callTool('exec', { command: 'echo hi' });
     assert.match(res.blockReason, /unreachable/);
-    for (let i = 0; i < 100 && !p.runtimeCalls.length; i++) await new Promise((r) => setTimeout(r, 10));
-    assert.match(String(p.runtimeCalls[0]?.args[1]), /Unreachable/);
+    for (let i = 0; i < 100 && !p.runtimeCalls.some((c) => /Unreachable/.test(JSON.stringify(c))); i++) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(p.runtimeCalls.some((c) => /Unreachable/.test(JSON.stringify(c))), 'outage alert sent');
   }));
 });
 

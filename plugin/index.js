@@ -507,6 +507,14 @@ class InvalidAmpResponseError extends Error {}
 
 // /api/hitl/request answered HTTP 4xx: AMP is up and refused the request (LOW2).
 // `error` is the JSON body's string `error` field, or null.
+/** /api/hitl/request answered with an HTTP 5xx: AMP is reachable but failed (Wave 3 Note A). */
+class AmpServerError extends Error {
+  constructor(status) {
+    super(`/api/hitl/request returned HTTP ${status}`);
+    this.status = status;
+  }
+}
+
 class AmpRejectedRequestError extends Error {
   constructor(status, error) {
     super(`/api/hitl/request returned HTTP ${status}${error ? ` (${error})` : ''}`);
@@ -556,7 +564,7 @@ async function requestHitlEval(instanceId, tool, params, actionId, { signal, dea
   if (res.status >= 400 && res.status < 500) {
     throw new AmpRejectedRequestError(res.status, await rejectionErrorCode(res));
   }
-  if (!res.ok) throw new Error(`/api/hitl/request returned HTTP ${res.status}`);
+  if (!res.ok) throw new AmpServerError(res.status);
   try {
     return await res.json();
   } catch (err) {
@@ -1003,6 +1011,11 @@ async function requestFailureOutcome(err, instanceId, tool, signal) {
   if (err instanceof AmpRejectedRequestError) {
     return blockOutcome(`Tool call "${tool}" blocked — AMP rejected the policy check (HTTP ${err.status}).`,
       !isBackendNative4xx(err));
+  }
+  // Note A: an HTTP 5xx is an answer, not an outage — no unreachable state, no alert.
+  // The request may have reached agent-hitl, so the instance retires (K2.3).
+  if (err instanceof AmpServerError) {
+    return blockOutcome(`Tool call "${tool}" blocked — AMP returned HTTP ${err.status} for the policy check.`, true);
   }
   if (err instanceof InvalidAmpResponseError) {
     return blockOutcome(`AMP returned an invalid response to the policy check. Tool "${tool}" was blocked as a safety measure.`, true);
