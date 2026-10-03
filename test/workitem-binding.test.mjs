@@ -6,6 +6,8 @@
 // Default test config: 50 ms poll interval inside a 3 s HITL window.
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { loadPlugin } from './helpers/load-plugin.mjs';
 
 const DECISION = ['GET', '/api/hitl/get-decision'];
@@ -80,11 +82,58 @@ describe('K2 — bind each call to its own work item', () => {
     assert.match(res.blockReason, /rejected by a human reviewer/);
   }));
 
-  test('first call on a fresh instance still accepts an id-less decision (legacy backend)', (t) => withPlugin(t, async (p) => {
+  test('first call on a fresh instance does not accept an id-less decision (times out, blocks)', (t) => withPlugin(t, async (p) => {
     p.stub.script('POST /api/hitl/request', [pending(null)]);
     p.stub.script('GET /api/hitl/get-decision', [done('approve', null)]);
-    assert.deepEqual(await exec(p), {});
-    assert.equal(p.stub.count(...DECISION), 1);
+    const res = await exec(p);
+    assert.equal(res?.block, true, `must not allow: ${JSON.stringify(res)}`);
+    assert.match(res.blockReason, /timed out/);
+    assert.ok(p.stub.count(...DECISION) > 1);
+  }));
+
+  test('after a restart the stale decision of the restored instance is never accepted', (t) => withPlugin(t, async (p) => {
+    fs.writeFileSync(
+      path.join(p.stateDir, 'hooks', 'amp', 'plugin-session.json'),
+      JSON.stringify({ instanceId: 'inst-old', writer: 'plugin' }),
+    );
+    p.stub.script('POST /api/hitl/request', [pending(null)]);
+    p.stub.script('GET /api/hitl/get-decision', [
+      done('approve', 'wi-old'),
+      pending('wi-2'),
+      done('reject', 'wi-2'),
+    ]);
+    const res = await exec(p);
+    assert.equal(res?.block, true, `must not allow: ${JSON.stringify(res)}`);
+    assert.match(res.blockReason, /rejected by a human reviewer/);
+    assert.equal(p.stub.count('POST', '/api/agent/init'), 0, 'restored instance must be reused');
+    assert.equal(p.stub.requests((r) => r.path === '/api/hitl/request')[0].body.instance_id, 'inst-old');
+    assert.equal(p.stub.count(...DECISION), 3);
+  }));
+
+  test('unbound terminal ids are remembered and never accepted later', (t) => withPlugin(t, async (p) => {
+    p.stub.script('POST /api/hitl/request', [pending(null)]);
+    p.stub.script('GET /api/hitl/get-decision', [
+      done('approve', 'wi-old'),
+      pending('wi-old'),
+      pending('wi-2'),
+      done('reject', 'wi-2'),
+    ]);
+    const res = await exec(p);
+    assert.equal(res?.block, true, `must not allow: ${JSON.stringify(res)}`);
+    assert.match(res.blockReason, /rejected by a human reviewer/);
+  }));
+
+  test('request response with an already-seen workitem_id does not bind the call', (t) => withPlugin(t, async (p) => {
+    await approvedFirstCall(p);
+    p.stub.script('POST /api/hitl/request', [pending('wi-1')]);
+    p.stub.script('GET /api/hitl/get-decision', [
+      done('approve', 'wi-1'),
+      pending('wi-2'),
+      done('reject', 'wi-2'),
+    ]);
+    const res = await exec(p);
+    assert.equal(res?.block, true, `must not allow: ${JSON.stringify(res)}`);
+    assert.match(res.blockReason, /rejected by a human reviewer/);
   }));
 
   test('a cancelled body for another work item is ignored', (t) => withPlugin(t, async (p) => {

@@ -464,20 +464,22 @@ function rememberWorkitem(seen, workitemId) {
 const nonEmptyId = (v) => (typeof v === 'string' && v !== '' ? v : null);
 
 /**
- * Pure verdict for one get-decision body. Returns { action, bind? } where
- * action is 'accept' (terminal, ours), 'ignore' (terminal, not provably ours)
- * or 'wait' (not terminal); bind = id this call should bind to now.
+ * Pure verdict for one get-decision body. Returns { action, bind?, remember? }
+ * where action is 'accept' (terminal, ours), 'ignore' (terminal, not provably
+ * ours) or 'wait' (not terminal); bind = id this call binds to now; remember =
+ * id to add to the instance's seen set without binding.
+ * A call only accepts a decision for a work item it has already seen pending
+ * (request response or pending poll). An unbound call never accepts a terminal
+ * body: after a restart the seen set is empty and get-decision returns the
+ * restored instance's last resolved work item (H3). Fail-closed: a review that
+ * resolves before the first poll times out and blocks.
  */
 function classifyDecision(data, bound, seen) {
   const id = nonEmptyId(data.workitem_id);
   const terminal = data.status === 'complete' || isCancelledDecision(data);
   if (!terminal) return !bound && id && !seen.has(id) ? { action: 'wait', bind: id } : { action: 'wait' };
   if (bound) return { action: id === bound ? 'accept' : 'ignore' };
-  if (id) return seen.has(id) ? { action: 'ignore' } : { action: 'accept', bind: id };
-  // Unbound and the body carries no workitem_id: unverifiable. Keep the legacy
-  // accept only while this instance has never seen a work item (nothing it
-  // could be confused with); otherwise keep polling. (Lead question.)
-  return { action: seen.size === 0 ? 'accept' : 'ignore' };
+  return id ? { action: 'ignore', remember: id } : { action: 'ignore' };
 }
 
 /** One get-decision round-trip: parsed object body, or null to retry. */
@@ -549,6 +551,7 @@ async function pollHitlDecision(callerId, { signal, boundWorkitemId, actionId } 
       rememberWorkitem(seen, verdict.bind);
       bound = verdict.bind;
     }
+    if (verdict.remember) rememberWorkitem(seen, verdict.remember);
     if (verdict.action === 'accept') return data;
     if (verdict.action === 'ignore' && !warnedOther) {
       warnedOther = true;
@@ -592,9 +595,12 @@ async function checkToolPolicy(instanceId, tool, params, { signal, actionId } = 
 
   // Never dereference hitlResponse directly: null / array / scalar bodies fail closed below.
   const body = hitlResponse && typeof hitlResponse === 'object' && !Array.isArray(hitlResponse) ? hitlResponse : {};
-  // K2: bind to the request's work item at once, before any await.
-  const boundWorkitemId = nonEmptyId(body.workitem_id);
-  if (boundWorkitemId) rememberWorkitem(seenWorkitemsFor(instanceId), boundWorkitemId);
+  // K2: bind to the request's work item at once, before any await — unless the
+  // instance has already seen that id (stale or another call's): then stay unbound.
+  const seen = seenWorkitemsFor(instanceId);
+  const requestWorkitemId = nonEmptyId(body.workitem_id);
+  const boundWorkitemId = requestWorkitemId && !seen.has(requestWorkitemId) ? requestWorkitemId : null;
+  if (boundWorkitemId) rememberWorkitem(seen, boundWorkitemId);
   const status = typeof body.status === 'string' ? body.status : '';
   const rawReason = body.reason || body.information || '';
   const reason = typeof rawReason === 'string' ? rawReason : JSON.stringify(rawReason);
@@ -623,7 +629,7 @@ async function checkToolPolicy(instanceId, tool, params, { signal, actionId } = 
   }
 
   // ── HITL required — wait for human decision ──────────────────────────────
-  if (status === 'pending' || status === 'waiting-for-response' || boundWorkitemId) {
+  if (status === 'pending' || status === 'waiting-for-response' || requestWorkitemId) {
     console.log(`[AMP Governance] HITL required for "${tool}" — waiting for human decision...`);
     await ampLog(instanceId, `HITL requested for tool: ${tool} — awaiting human approval in AMP`, 'WARN');
 
