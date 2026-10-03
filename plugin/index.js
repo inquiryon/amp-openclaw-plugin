@@ -787,10 +787,11 @@ async function requestAndAwaitDecision(instanceId, tool, params, { signal, actio
       }
       if (!(err instanceof HitlTimeoutError)) {
         // Network failure (not our request timeout): AMP is unreachable, not the reviewer slow.
-        const em = err && err.message ? err.message : String(err);
+        const em = err?.cause?.code || (err && err.message ? err.message : String(err));
         const msg = `Tool call "${tool}" blocked — AMP became unreachable while waiting for the AMP review (${em}).`;
         console.error(`[AMP Governance] ${msg}`);
         await ampLog(instanceId, msg, 'ERROR');
+        notifyUser(_lastSender, `AMP became unreachable during the review for "${tool}" — the call was blocked.`);
         return { block: true, blockReason: msg };
       }
       const msg = `Tool call "${tool}" timed out waiting for human approval — blocked.`;
