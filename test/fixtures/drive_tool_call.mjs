@@ -25,6 +25,8 @@ const STUB_LOG = process.env.STUB_LOG || path.join(os.tmpdir(), 'amp-oc-stub_req
 const MODES = arg('--modes', 'allow,hitl_approve,hitl_reject,no_policy,policy_error,garbage,down,hitl_slow').split(',');
 const OUT = arg('--out', null);
 const WITH_SIGNAL = argv.includes('--signal');
+// --abort-after-gate (with --signal): abort the caller signal as soon as the host gate returns.
+const ABORT_AFTER_GATE = WITH_SIGNAL && argv.includes('--abort-after-gate');
 const SLOW_WAIT_MS = Number(process.env.SLOW_WAIT_MS || 25000);
 const dist = path.join(OC_PKG, 'dist');
 const imp = (p) => import(pathToFileURL(p).href);
@@ -124,6 +126,7 @@ for (const mode of MODES) {
   r.hostGateEndTs = Date.now() / 1000;
   r.hostGateLogOffset = logOffset();
   r.callerSignalAborted = ac ? ac.signal.aborted : null;
+  if (ac && ABORT_AFTER_GATE) { ac.abort(); r.abortedAfterGate = true; }
   r.stubDuringHostGate = stubRequestsSince(off);
 
   // (b) wrapped tool: does the fake exec tool actually execute?
@@ -158,8 +161,11 @@ if (MODES.includes('hitl_slow')) {
   slow.stubAfterWait = stubRequestsSince(0).slice(-6);
   // Polls the plugin made after the host gate had already returned: >0 after a host
   // timeout means the hook's ctx.abortSignal was NOT aborted by the timeout.
-  slow.pollsAfterHostGate = stubEntriesSince(slow.hostGateLogOffset)
-    .filter((e) => e.path === '/api/hitl/get-decision' && e.ts >= slow.hostGateEndTs).length;
+  // Only meaningful with --signal (no wrapped/raw calls adding their own polls).
+  if (WITH_SIGNAL) {
+    slow.pollsAfterHostGate = stubEntriesSince(slow.hostGateLogOffset)
+      .filter((e) => e.path === '/api/hitl/get-decision' && e.ts >= slow.hostGateEndTs).length;
+  }
 }
 await setMode('allow');
 const json = JSON.stringify(report, null, 2);

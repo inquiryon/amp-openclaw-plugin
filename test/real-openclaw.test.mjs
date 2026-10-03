@@ -71,7 +71,7 @@ const runNode = (script, args, env) => new Promise((resolve, reject) => {
 });
 
 describe('real OpenClaw host', { skip: SKIP }, () => {
-  let tmp; let stub; let env; let toolReport; let probeReport;
+  let tmp; let stub; let env; let toolReport; let probeReport; let abortReport;
 
   before(async () => {
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'amp-oc-real-'));
@@ -108,13 +108,18 @@ describe('real OpenClaw host', { skip: SKIP }, () => {
     const probeCfg = path.join(tmp, 'openclaw-probe.json');
     fs.writeFileSync(probeCfg, JSON.stringify({ plugins: { load: { paths: [pluginDir] }, entries: {
       'amp-governance': { enabled: true, hooks: { timeouts: { before_tool_call: PROBE_HOOK_TIMEOUT_MS } } } } } }));
-    const probeOut = path.join(tmp, 'probe-result.json');
-    const probeState = path.join(tmp, 'state-probe');
-    fs.cpSync(stateDir, probeState, { recursive: true });
-    for (const f of ['plugin-session.json', 'hook-session.json']) fs.rmSync(path.join(probeState, 'hooks', 'amp', f), { force: true });
-    await runNode('drive_tool_call.mjs', ['--modes', 'hitl_slow', '--signal', '--out', probeOut],
-      { ...env, OPENCLAW_STATE_DIR: probeState, OPENCLAW_CONFIG_PATH: probeCfg });
-    probeReport = JSON.parse(fs.readFileSync(probeOut, 'utf8'));
+    const runProbe = async (name, extraArgs) => {
+      const out = path.join(tmp, `${name}-result.json`);
+      const state = path.join(tmp, `state-${name}`); // fresh state -> fresh AMP instance per probe
+      fs.cpSync(stateDir, state, { recursive: true });
+      for (const f of ['plugin-session.json', 'hook-session.json']) fs.rmSync(path.join(state, 'hooks', 'amp', f), { force: true });
+      await runNode('drive_tool_call.mjs', ['--modes', 'hitl_slow', '--signal', ...extraArgs, '--out', out],
+        { ...env, OPENCLAW_STATE_DIR: state, OPENCLAW_CONFIG_PATH: probeCfg });
+      return JSON.parse(fs.readFileSync(out, 'utf8'));
+    };
+    probeReport = await runProbe('probe', []);
+    // Control: the caller aborts right after the host gate returns -> the plugin must stop polling.
+    abortReport = await runProbe('abort', ['--abort-after-gate']);
   });
 
   after(() => {
@@ -123,7 +128,7 @@ describe('real OpenClaw host', { skip: SKIP }, () => {
     const keep = process.env.AMP_REAL_REPORT_DIR;
     if (keep && tmp) {
       fs.mkdirSync(keep, { recursive: true });
-      for (const f of ['tool-result.json', 'probe-result.json', 'hook-result.json']) {
+      for (const f of ['tool-result.json', 'probe-result.json', 'abort-result.json', 'hook-result.json']) {
         const src = path.join(tmp, f);
         if (fs.existsSync(src)) fs.copyFileSync(src, path.join(keep, f));
       }
@@ -151,13 +156,22 @@ describe('real OpenClaw host', { skip: SKIP }, () => {
     assert.ok(r.hostGateMs >= DECISION_DELAY_S * 1000 && r.hostGateMs < 30_000, `hostGateMs=${r.hostGateMs}`);
   });
 
-  test('Q4: hook timeout expiry does not abort ctx.abortSignal (plugin keeps polling)', () => {
+  test('Q4: hook timeout expiry does not cancel the plugin (it keeps polling)', () => {
     const r = probeReport.modes.hitl_slow;
     assert.equal(r.hostGate.blocked, true, JSON.stringify(r.hostGate));
-    assert.ok(r.hostGateMs >= PROBE_HOOK_TIMEOUT_MS && r.hostGateMs < PROBE_HOOK_TIMEOUT_MS + 5000, `hostGateMs=${r.hostGateMs}`);
+    assert.equal(r.hostGate.kind, 'failure', JSON.stringify(r.hostGate)); // host timeout, not a plugin veto
+    // Blocked by the 5 s operator timeout, well before the 20 s decision (observed 4.3-5.1 s).
+    assert.ok(r.hostGateMs < DECISION_DELAY_S * 1000 - 5000, `hostGateMs=${r.hostGateMs}`);
     assert.equal(r.callerSignalAborted, false);
     // Characterization of OpenClaw 2026.9.5: polls continue after the host gave up.
     assert.ok(r.pollsAfterHostGate > 0, `pollsAfterHostGate=${r.pollsAfterHostGate}`);
+  });
+
+  test('A3 control: the plugin receives ctx.abortSignal and stops polling when it aborts', () => {
+    const r = abortReport.modes.hitl_slow;
+    assert.equal(r.hostGate.kind, 'failure', JSON.stringify(r.hostGate));
+    assert.equal(r.abortedAfterGate, true);
+    assert.ok(r.pollsAfterHostGate <= 1, `pollsAfterHostGate=${r.pollsAfterHostGate} (at most one poll in flight)`);
   });
 
   test('internal hook loads without error', async () => {
