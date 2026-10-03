@@ -223,9 +223,7 @@ function runAmpConnect(opts) {
       AMP_ORG_ID: opts.orgId,
       HITL_TIMEOUT_MINUTES: Number(opts.hitlTimeout) || 10,
     };
-    // LOW6: the file holds the API key — owner-only, also when replacing an existing file.
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(newConfig, null, 2) + '\n', { mode: 0o600 });
-    try { fs.chmodSync(CONFIG_FILE, 0o600); } catch (err) { console.warn(`! Could not restrict ${CONFIG_FILE} to 0600: ${err.message}`); }
+    writeConfigAtomically(JSON.stringify(newConfig, null, 2) + '\n');
     console.log('✓ Config written.');
   } catch (err) {
     console.error(`✗ Failed to write config: ${err.message}`);
@@ -252,6 +250,23 @@ function runAmpConnect(opts) {
   }
 
   console.log(`✓ Connected — agent "${opts.agentName}" is now governed by AMP.`);
+}
+
+/**
+ * LOW6: the file holds the API key. Write it to a fresh owner-only temp file
+ * in the same dir, then rename it over CONFIG_FILE, so the key is never in a
+ * file group/other can read — not even briefly when replacing an existing
+ * 0644 file. The temp file is removed if anything fails.
+ */
+function writeConfigAtomically(text) {
+  const tmp = path.join(path.dirname(CONFIG_FILE), `.amp_config.json.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    fs.writeFileSync(tmp, text, { mode: 0o600, flag: 'wx' });
+    fs.renameSync(tmp, CONFIG_FILE);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw err;
+  }
 }
 
 /**
