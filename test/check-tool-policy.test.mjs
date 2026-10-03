@@ -1,10 +1,9 @@
 // Tier 1: before_tool_call governance decisions against the in-process stub.
-// Non-todo tests pin today's behaviour; `todo` tests are the target behaviour
-// for spec items A1 (fail closed on policy_error/unknown/null bodies),
+// Covers spec items A1 (fail closed on policy_error/unknown/null bodies),
 // A2 (block modify until params can be applied) and A3 (honour poll interval).
 //
-// Until A3 lands index.js polls every 3000 ms (hard-coded), so each HITL case
-// here costs ~3 s: HITL_TIMEOUT_MINUTES 0.05 (= 3 s) allows exactly one poll.
+// The default test config polls every 50 ms (HITL_POLL_INTERVAL_MS) inside a
+// 3 s HITL window (HITL_TIMEOUT_MINUTES 0.05).
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { loadPlugin } from './helpers/load-plugin.mjs';
@@ -173,7 +172,7 @@ const MATRIX = [
   { mode: 'hitl_modify', expect: 'block' },
   { mode: 'hitl_cancelled', expect: 'block' },
   // 2 pending polls then approve: needs the 50 ms poll interval (A3) to fit the 3 s timeout.
-  { mode: 'hitl_slow', expect: 'allow', todo: 'A3' },
+  { mode: 'hitl_slow', expect: 'allow' },
   { mode: 'poll429', expect: 'block' },
 ];
 

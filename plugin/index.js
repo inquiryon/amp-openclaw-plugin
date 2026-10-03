@@ -23,8 +23,6 @@ const CONFIG_FILE = `${OPENCLAW_STATE_DIR}/hooks/amp/amp_config.json`;
 // Tools that are internal/noisy — skip logging and policy checks
 const SKIP_TOOLS = new Set(['session_status', 'heartbeat']);
 
-const HITL_POLL_INTERVAL_MS = 3000; // 3 seconds between polls
-
 let config = null;
 try {
   config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
@@ -58,8 +56,17 @@ function getAmpApiKey() {
   return key;
 }
 
+function positiveNumber(value, fallback) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
 // HITL timeout — configurable via HITL_TIMEOUT_MINUTES in amp_config.json (default: 10)
-const HITL_TIMEOUT_MS = (config?.HITL_TIMEOUT_MINUTES ?? 10) * 60 * 1000;
+const HITL_TIMEOUT_MS = positiveNumber(config?.HITL_TIMEOUT_MINUTES, 10) * 60 * 1000;
+// Poll interval — configurable via HITL_POLL_INTERVAL_MS in amp_config.json (default: 3000)
+const HITL_POLL_INTERVAL_MS = positiveNumber(config?.HITL_POLL_INTERVAL_MS, 3000);
+// Requested before_tool_call budget: the HITL window plus slack for the
+// request/log round-trips. An operator override in openclaw.json wins.
+const HOOK_TIMEOUT_MS = HITL_TIMEOUT_MS + 30_000;
 
 // Module-level instance cache so we only init once per process lifetime
 let _instanceId = null;
@@ -371,17 +378,34 @@ async function requestHitlEval(instanceId, tool, params) {
 }
 
 
+/** Resolves after ms; rejects early (and clears the timer) when signal aborts. */
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason ?? new Error('aborted'));
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new Error('aborted'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 /**
  * Poll /api/hitl/get-decision until we get a 'complete' status or time out.
+ * Rejects as soon as `signal` aborts (run cancelled).
  */
-async function pollHitlDecision(callerId) {
+async function pollHitlDecision(callerId, { signal } = {}) {
   const apiKey = getAmpApiKey();
   const deadline = Date.now() + HITL_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, HITL_POLL_INTERVAL_MS));
+    await sleep(HITL_POLL_INTERVAL_MS, signal);
     const res = await fetch(
       `${buildAmpUrl('/api/hitl/get-decision')}?caller_id=${encodeURIComponent(callerId)}`,
-      { headers: { 'X-API-Key': apiKey } }
+      { headers: { 'X-API-Key': apiKey }, signal }
     );
     if (!res.ok) {
       console.warn(`[AMP Governance] get-decision returned ${res.status}, retrying...`);
@@ -400,7 +424,7 @@ async function pollHitlDecision(callerId) {
  * Fails closed on unreachable AMP, non-2xx, no_policy, policy_error,
  * unknown status, and poll timeout.
  */
-async function checkToolPolicy(instanceId, tool, params) {
+async function checkToolPolicy(instanceId, tool, params, { signal } = {}) {
   const paramSummary = formatInput(tool, params);
   await ampLog(instanceId, `Policy check: ${tool} | ${paramSummary}`);
 
@@ -461,8 +485,13 @@ async function checkToolPolicy(instanceId, tool, params) {
 
     let decision;
     try {
-      decision = await pollHitlDecision(instanceId);
+      decision = await pollHitlDecision(instanceId, { signal });
     } catch (err) {
+      if (signal?.aborted) {
+        const msg = `Tool call "${tool}" blocked — run cancelled while waiting for AMP review.`;
+        await ampLog(instanceId, msg, 'WARN');
+        return { block: true, blockReason: msg };
+      }
       const msg = `Tool call "${tool}" timed out waiting for human approval — blocked.`;
       await ampLog(instanceId, msg, 'ERROR');
       notifyUser(_lastSender, `No response from the reviewer — "${tool}" was blocked due to timeout.`);
@@ -659,7 +688,7 @@ export default {
     });
 
     // ── BEFORE TOOL CALL: governance check + logging ─────────────────────────
-    api.on('before_tool_call', async (event) => {
+    api.on('before_tool_call', async (event, ctx) => {
       const tool = event.toolName || event.name || 'unknown-tool';
       if (SKIP_TOOLS.has(tool)) return {};
 
@@ -689,8 +718,8 @@ export default {
       await ampLog(instanceId, message);
 
       // Governance check — returns {} to allow or { block, blockReason } to block
-      return await checkToolPolicy(instanceId, tool, event.params);
-    });
+      return await checkToolPolicy(instanceId, tool, event.params, { signal: ctx?.abortSignal });
+    }, { timeoutMs: HOOK_TIMEOUT_MS });
 
     // ── AFTER TOOL CALL: result logging ──────────────────────────────────────
     api.on('after_tool_call', async (event) => {
