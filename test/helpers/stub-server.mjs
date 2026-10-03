@@ -10,7 +10,8 @@
 //
 // Every /api/* request is recorded as {method, path, query, body, headers:{'x-api-key'}}.
 // `stub.script('POST /api/hitl/request', [{status, body}|{status, raw}|{destroy:true}, ...])`
-// overrides a route with a response queue; the last entry repeats.
+// overrides a route with a response queue; the last entry repeats. Any entry may
+// add `delayMs` to hold its answer back (slow or hung backend).
 import http from 'node:http';
 
 const json = (status, body) => ({ status, body });
@@ -110,6 +111,13 @@ function readBody(req) {
 }
 
 function send(res, req, response) {
+  if (response.delayMs > 0) {
+    // Hold the answer back (slow/hung backend); skipped if the client gave up.
+    setTimeout(() => {
+      if (!res.destroyed && !res.writableEnded) send(res, req, { ...response, delayMs: 0 });
+    }, response.delayMs);
+    return;
+  }
   if (response.destroy) {
     req.socket.destroy();
     return;

@@ -76,6 +76,23 @@ const HOOK_TIMEOUT_MS = HITL_TIMEOUT_MS + 30_000;
 const ACTION_ID_CORRELATION = config?.ACTION_ID_CORRELATION === true;
 // Block if no work item appears for this action_id within this window (default 60 s).
 const ACTION_ID_WATCHDOG_MS = positiveNumber(config?.ACTION_ID_WATCHDOG_SECONDS, 60) * 1000;
+// Cap on any single AMP HTTP request (default 15 s); also bounded by the call's deadline.
+const AMP_REQUEST_TIMEOUT_MS = positiveNumber(config?.AMP_REQUEST_TIMEOUT_MS, 15_000);
+
+/**
+ * Signal for one AMP request: aborts when the caller's signal does, or after
+ * AMP_REQUEST_TIMEOUT_MS, or at the call's deadline — whichever comes first.
+ */
+function requestSignal(signal, deadline) {
+  const budget = deadline == null ? AMP_REQUEST_TIMEOUT_MS : Math.min(AMP_REQUEST_TIMEOUT_MS, deadline - Date.now());
+  const ms = Math.max(1, Math.floor(budget));
+  // Only a real AbortSignal can be composed; callers re-check signal.aborted anyway.
+  const callerSignal = signal instanceof AbortSignal ? [signal] : [];
+  return AbortSignal.any([...callerSignal, AbortSignal.timeout(ms)]);
+}
+
+/** True when err is our own request timeout (not a caller abort). */
+const isRequestTimeout = (err, signal) => err?.name === 'TimeoutError' && !signal?.aborted;
 
 // Module-level instance cache so we only init once per process lifetime
 let _instanceId = null;
@@ -234,6 +251,7 @@ async function ensureInstance() {
         config:     { agent_mode: 'polling' },
         metadata:   { source: 'openclaw-amp-plugin', owner: config.AMP_USERNAME },
       }),
+      signal: requestSignal(),
     });
     if (!res.ok) {
       const bodyText = await res.text().catch(() => '');
@@ -278,9 +296,10 @@ async function ampLog(instanceId, message, level = 'INFO') {
         org_id:      config.AMP_ORG_ID,
         username:    config.AMP_USERNAME,
       }),
+      signal: requestSignal(),
     });
   } catch (err) {
-    console.error('[AMP Governance] ampLog failed:', err.message);
+    console.error('[AMP Governance] ampLog failed:', err?.message || String(err));
   }
 }
 
@@ -367,7 +386,7 @@ class InvalidAmpResponseError extends Error {}
  * Call /api/hitl/request with the tool call details.
  * The AMP backend eval engine decides allow vs HITL.
  */
-async function requestHitlEval(instanceId, tool, params, actionId) {
+async function requestHitlEval(instanceId, tool, params, actionId, { signal, deadline } = {}) {
   const apiKey = getAmpApiKey();
   const { tool: normTool, action: normAction } = normalizeTool(tool, params);
   const res = await fetch(buildAmpUrl('/api/hitl/request'), {
@@ -388,6 +407,7 @@ async function requestHitlEval(instanceId, tool, params, actionId) {
         // who/what/where resolved by the backend from the policy's hitl_spec
       },
     }),
+    signal: requestSignal(signal, deadline),
   });
   if (!res.ok) throw new Error(`/api/hitl/request returned HTTP ${res.status}`);
   try {
@@ -501,11 +521,11 @@ class UnverifiableDecisionError extends Error {
 }
 
 /** One get-decision round-trip: parsed object body, or null to retry. */
-async function fetchDecisionBody(apiKey, callerId, actionId, signal) {
+async function fetchDecisionBody(apiKey, callerId, actionId, signal, deadline) {
   const actionQuery = actionId ? `&action_id=${encodeURIComponent(actionId)}` : '';
   const res = await fetch(
     `${buildAmpUrl('/api/hitl/get-decision')}?caller_id=${encodeURIComponent(callerId)}${actionQuery}`,
-    { headers: { 'X-API-Key': apiKey }, signal }
+    { headers: { 'X-API-Key': apiKey }, signal: requestSignal(signal, deadline) }
   );
   if (POLL_FATAL_STATUS.has(res.status)) {
     throw new PollFatalError(res.status, await res.text().catch(() => ''));
@@ -560,8 +580,17 @@ async function pollHitlDecision(callerId, { signal, boundWorkitemId, actionId, d
   // C10: the call's budget includes any wait for the instance lock.
   const deadline = callDeadline ?? started + HITL_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    await sleep(HITL_POLL_INTERVAL_MS, signal);
-    const data = await fetchDecisionBody(apiKey, callerId, actionId, signal);
+    // Never sleep past the call's deadline; skip the poll once it has passed.
+    await sleep(Math.min(HITL_POLL_INTERVAL_MS, deadline - Date.now()), signal);
+    if (Date.now() >= deadline) break;
+    let data;
+    try {
+      data = await fetchDecisionBody(apiKey, callerId, actionId, signal, deadline);
+    } catch (err) {
+      if (!isRequestTimeout(err, signal)) throw err;
+      console.warn('[AMP Governance] get-decision timed out, retrying...');
+      data = null; // transient: keep polling until the deadline
+    }
     if (!data) { checkActionIdWatchdog(actionId, bound, started); continue; }
     checkActionIdEcho(data, actionId);
     // Bind synchronously with the check so a concurrent call cannot take the id.
@@ -655,7 +684,7 @@ async function checkToolPolicy(instanceId, tool, params, { signal, actionId, dea
 async function requestAndAwaitDecision(instanceId, tool, params, { signal, actionId, deadline }) {
   let hitlResponse;
   try {
-    hitlResponse = await requestHitlEval(instanceId, tool, params, actionId);
+    hitlResponse = await requestHitlEval(instanceId, tool, params, actionId, { signal, deadline });
     // Successful contact with AMP — clear any prior down state
     await notifyAmpRecovered();
   } catch (err) {
@@ -665,8 +694,14 @@ async function requestAndAwaitDecision(instanceId, tool, params, { signal, actio
     if (err instanceof InvalidAmpResponseError) {
       return { block: true, blockReason: `AMP returned an invalid response to the policy check. Tool "${tool}" was blocked as a safety measure.` };
     }
+    if (signal?.aborted) {
+      return { block: true, blockReason: `Tool call "${tool}" blocked — run cancelled before AMP answered the policy check.` };
+    }
     _ampReachable = false;
     await notifyAmpDown(tool, em);
+    if (isRequestTimeout(err, signal)) {
+      return { block: true, blockReason: `AMP Governance service did not answer the policy check in time. Tool "${tool}" was blocked as a safety measure.` };
+    }
     return { block: true, blockReason: `AMP Governance service is unreachable. Tool "${tool}" was blocked as a safety measure. Restore the AMP backend and retry.` };
   }
 
