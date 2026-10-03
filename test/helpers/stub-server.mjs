@@ -8,10 +8,19 @@
 //   GET  /api/hitl/get-decision -> depends on mode
 //   POST /__mode {mode}         -> switch mode (400 on unknown mode; never a default allow)
 //
+// HITL modes model production (H3): /api/hitl/request answers {status:'pending'}
+// with NO workitem_id; the first get-decision poll reports the new work item
+// pending, later polls answer the mode's terminal body for it. Opt in to the
+// legacy bound shape (request carries workitem_id) with
+// setMode(name, {boundRequest: true}).
+//
 // Every /api/* request is recorded as {method, path, query, body, headers:{'x-api-key'}}.
 // `stub.script('POST /api/hitl/request', [{status, body}|{status, raw}|{destroy:true}, ...])`
 // overrides a route with a response queue; the last entry repeats. Any entry may
 // add `delayMs` to hold its answer back (slow or hung backend).
+// `stub.respond('GET /api/hitl/get-decision', (req) => response | undefined)` answers a
+// route from the request ({method, path, query, body}) — e.g. scoped by caller_id like
+// the real backend. It wins over script() and the mode; undefined falls through.
 import http from 'node:http';
 
 const json = (status, body) => ({ status, body });
@@ -20,7 +29,8 @@ function pendingRequest(state) {
   const workitemId = `wi-${++state.wiCounter}`;
   state.boundWorkitem = workitemId;
   state.polls = 0;
-  return json(200, { status: 'pending', workitem_id: workitemId });
+  if (state.modeOpts.boundRequest) return json(200, { status: 'pending', workitem_id: workitemId });
+  return json(200, { status: 'pending' });
 }
 
 function complete(state, resolution, extra = {}) {
@@ -88,9 +98,10 @@ export const MODE_NAMES = Object.freeze(Object.keys(MODES));
 function freshState() {
   return {
     mode: 'allow',
-    modeOpts: { pendingPolls: 2 },
+    modeOpts: { pendingPolls: 2, boundRequest: false },
     records: [],
     scripts: new Map(),
+    responders: new Map(),
     instCounter: 0,
     wiCounter: 0,
     boundWorkitem: undefined,
@@ -130,8 +141,14 @@ function send(res, req, response) {
   res.end(payload);
 }
 
-function routeResponse(state, method, path, body) {
+function routeResponse(state, method, path, body, query) {
   const key = `${method} ${path}`;
+  const responder = state.responders.get(key);
+  const answer = responder ? responder({ method, path, query, body }) : undefined;
+  if (answer !== undefined) {
+    if (key === 'GET /api/hitl/get-decision') state.polls += 1;
+    return answer;
+  }
   const queue = state.scripts.get(key);
   if (queue && queue.length) {
     // Scripted responses still advance the poll counter for hitl_slow bookkeeping.
@@ -151,6 +168,11 @@ function routeResponse(state, method, path, body) {
       // Non-HITL mode polled anyway: answer pending so a buggy caller never gets an approve.
       return json(200, { status: 'pending', workitem_id: state.boundWorkitem });
     }
+    // Id-less request (H3): the first poll is where the caller learns its work item.
+    // poll429 rejects every poll, the first one included.
+    if (!state.modeOpts.boundRequest && state.polls === 1 && state.boundWorkitem && mode !== MODES.poll429) {
+      return json(200, { status: 'pending', workitem_id: state.boundWorkitem });
+    }
     return mode.decision(state);
   }
   return json(404, { error: 'stub: unknown endpoint', path });
@@ -162,7 +184,8 @@ export async function startStub() {
   const setMode = (name, opts = {}) => {
     if (!Object.hasOwn(MODES, name)) throw new Error(`unknown mode: ${name}`);
     state.mode = name;
-    state.modeOpts = { ...state.modeOpts, ...opts };
+    // boundRequest is per setMode call; pendingPolls stays until changed.
+    state.modeOpts = { ...state.modeOpts, boundRequest: false, ...opts };
     state.polls = 0;
     state.boundWorkitem = undefined;
   };
@@ -186,7 +209,7 @@ export async function startStub() {
       body,
       headers: { 'x-api-key': req.headers['x-api-key'] },
     });
-    send(res, req, routeResponse(state, req.method, u.pathname, body));
+    send(res, req, routeResponse(state, req.method, u.pathname, body, query));
   });
 
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -201,6 +224,10 @@ export async function startStub() {
         throw new Error('script() needs a non-empty array of responses');
       }
       state.scripts.set(routeKey, [...responses]);
+    },
+    respond(routeKey, fn) {
+      if (typeof fn !== 'function') throw new Error('respond() needs a function');
+      state.responders.set(routeKey, fn);
     },
     requests(filterFn = () => true) {
       return state.records.filter(filterFn);

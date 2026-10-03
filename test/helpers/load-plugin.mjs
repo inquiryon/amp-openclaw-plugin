@@ -24,6 +24,9 @@ function makeFakeRuntime(calls) {
 /**
  * @param {object} [options]
  * @param {string} [options.mode]      stub mode to start in (default 'allow')
+ * @param {object} [options.modeOpts]  options for that mode (e.g. {boundRequest:true})
+ * @param {string} [options.stateDir]  reuse this OpenClaw state dir (a second "process" on the
+ *                                     same state; config rewritten, dir not removed by cleanup)
  * @param {object} [options.config]    overrides merged into amp_config.json
  * @param {object} [options.runtime]   replaces the fake api.runtime
  * @param {object} [options.stub]      reuse an existing stub (not closed by cleanup)
@@ -32,9 +35,10 @@ function makeFakeRuntime(calls) {
 export async function loadPlugin(options = {}) {
   const ownStub = !options.stub;
   const stub = options.stub ?? await startStub();
-  if (options.mode) stub.setMode(options.mode);
+  if (options.mode) stub.setMode(options.mode, options.modeOpts);
 
-  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amp-oc-test-'));
+  const ownStateDir = !options.stateDir;
+  const stateDir = options.stateDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'amp-oc-test-'));
   const configDir = path.join(stateDir, 'hooks', 'amp');
   fs.mkdirSync(configDir, { recursive: true });
   const config = {
@@ -90,7 +94,7 @@ export async function loadPlugin(options = {}) {
 
   const cleanup = async () => {
     restoreEnv();
-    fs.rmSync(stateDir, { recursive: true, force: true });
+    if (ownStateDir) fs.rmSync(stateDir, { recursive: true, force: true });
     if (ownStub) await stub.close();
   };
 

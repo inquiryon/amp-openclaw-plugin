@@ -11,7 +11,7 @@ Implements every endpoint the plugin (index.js) and hook (handler.ts) call:
   POST /api/hitl/request      -> depends on mode
   GET  /api/hitl/get-decision -> depends on mode
 
-Mode is switchable at runtime:  POST /__mode {"mode": "..."}  or  GET /__mode?set=...
+Mode is switchable at runtime:  POST /__mode {"mode": "...", "bound_request": false}  or  GET /__mode?set=...
 An unknown mode returns HTTP 400 {"error": "unknown mode"} and leaves the mode unchanged.
 Modes:
   allow            hitl/request -> {"status":"no-hitl"}
@@ -20,14 +20,17 @@ Modes:
   policy_error_200 hitl/request -> 200 {"status":"policy_error","reason":..,"message":"Missing field(s): who"}
   garbage          hitl/request -> {"status":"banana"}      (unknown status)
   null_body        hitl/request -> 200 literal null
-  hitl_approve     hitl/request -> {"status":"pending","workitem_id":..}; get-decision -> complete/approve
+  hitl_approve     hitl/request -> {"status":"pending"} (no workitem_id, like production H3);
+                   1st get-decision -> {"status":"pending","workitem_id":..}, then complete/approve
   hitl_reject      same, get-decision -> complete/reject
   hitl_modify      same, get-decision -> complete/modify + modified_action.params
   hitl_cancelled   same, get-decision -> K1 cancelled body (complete/reject, method cancelled)
   hitl_slow        same, get-decision stays "pending" for DECISION_DELAY_S then approve
-  poll429          same request; get-decision -> HTTP 429 {"error":"call_limit_reached"}
+  poll429          same request; every get-decision -> HTTP 429 {"error":"call_limit_reached"}
   down             every /api/* -> connection dropped (simulates backend down)
-Decisions echo the workitem_id returned by hitl/request for that caller_id.
+Work items and poll counts are scoped by caller_id, like the real backend.
+bound_request=true (POST /__mode, or STUB_BOUND_REQUEST=1) restores the legacy shape:
+hitl/request returns the workitem_id and the first poll is already the decision.
 Every request is appended as a JSON line to STUB_LOG (default: a file in the system temp dir).
 """
 import json
@@ -50,7 +53,8 @@ MODES = {"allow", "no_policy", "policy_error", "policy_error_200", "garbage", "n
 _initial = os.environ.get("STUB_MODE", "allow")
 if _initial not in MODES:
     sys.exit(f"stub_amp: unknown STUB_MODE {_initial!r}")
-STATE = {"mode": _initial, "pending_since": {}, "workitems": {}}
+STATE = {"mode": _initial, "pending_since": {}, "workitems": {}, "polls": {},
+         "bound_request": os.environ.get("STUB_BOUND_REQUEST") == "1"}
 LOCK = threading.Lock()
 
 
@@ -85,8 +89,10 @@ class H(BaseHTTPRequestHandler):
 
     def _set_mode(self, method, body, q):
         requested = None
+        bound = False
         if method == "POST" and isinstance(body, dict):
             requested = body.get("mode")
+            bound = body.get("bound_request") is True
         elif "set" in q:
             requested = q["set"]
         if requested is None:
@@ -94,14 +100,23 @@ class H(BaseHTTPRequestHandler):
         if requested not in MODES:
             return self._send(400, {"error": "unknown mode", "mode": STATE["mode"]})
         STATE["mode"] = requested
+        STATE["bound_request"] = bound
         STATE["pending_since"].clear()
         STATE["workitems"].clear()
+        STATE["polls"].clear()
         return self._send(200, {"mode": STATE["mode"]})
 
     def _decision(self, mode, cid):
         wi = STATE["workitems"].get(cid)
+        STATE["polls"][cid] = STATE["polls"].get(cid, 0) + 1
         if mode == "poll429":
             return self._send(429, {"error": "call_limit_reached"})
+        if not wi:
+            # No work item for this caller (never requested, or another caller's): nothing to decide.
+            return self._send(200, {"status": "pending"})
+        if not STATE["bound_request"] and STATE["polls"][cid] == 1:
+            # Id-less request (H3): the first poll is where the caller learns its work item.
+            return self._send(200, {"status": "pending", "workitem_id": wi})
         if mode == "hitl_slow":
             since = STATE["pending_since"].get(cid, time.time())
             if time.time() - since < DECISION_DELAY_S:
@@ -166,7 +181,10 @@ class H(BaseHTTPRequestHandler):
                 wi = "wi-" + uuid.uuid4().hex[:6]
                 STATE["pending_since"][cid] = time.time()
                 STATE["workitems"][cid] = wi
-                return self._send(200, {"status": "pending", "workitem_id": wi})
+                STATE["polls"][cid] = 0
+                if STATE["bound_request"]:
+                    return self._send(200, {"status": "pending", "workitem_id": wi})
+                return self._send(200, {"status": "pending"})
             return self._send(500, {"error": "stub: unhandled mode", "mode": mode})
         if u.path == "/api/hitl/get-decision" and method == "GET":
             return self._decision(mode, q.get("caller_id"))

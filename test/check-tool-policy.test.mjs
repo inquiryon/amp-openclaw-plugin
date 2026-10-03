@@ -11,11 +11,15 @@ import { loadPlugin } from './helpers/load-plugin.mjs';
 
 const DECISION = ['GET', '/api/hitl/get-decision'];
 
-async function withPlugin(t, mode, fn) {
-  const p = await loadPlugin({ mode });
+async function withPlugin(t, mode, fn, modeOpts) {
+  const p = await loadPlugin({ mode, modeOpts });
   t.after(() => p.cleanup());
   return fn(p);
 }
+
+// Scripted get-decision bodies below name wi-1 directly, so the request must
+// bind the call to wi-1 (legacy bound shape) instead of the id-less default.
+const BOUND = { boundRequest: true };
 
 async function outcome(p) {
   try {
@@ -56,10 +60,10 @@ describe('checkToolPolicy — current behaviour', () => {
     assert.equal(p.stub.count('POST', '/api/hitl/request'), 0);
   }));
 
-  test('pending -> approve allows', (t) => withPlugin(t, 'hitl_approve', async (p) => {
+  test('pending -> approve allows (id-less request: pending poll, then approve)', (t) => withPlugin(t, 'hitl_approve', async (p) => {
     const res = await p.callTool('exec', { command: 'echo hi' });
     assert.deepEqual(res, {});
-    assert.equal(p.stub.count(...DECISION), 1);
+    assert.equal(p.stub.count(...DECISION), 2);
   }));
 
   test('pending -> reject blocks with reviewer note', (t) => withPlugin(t, 'hitl_reject', async (p) => {
@@ -155,7 +159,7 @@ describe('checkToolPolicy — A1/A2 behaviour', () => {
       assert.match(res.blockReason, /modified version/);
       assert.match(res.blockReason, /Re-submit/);
       assert.match(res.blockReason, /use a safer command/);
-    }));
+    }, BOUND));
   }
 });
 
@@ -182,7 +186,7 @@ describe('pollHitlDecision — A4 fail fast on rejected polls', () => {
     const res = await p.callTool('exec', { command: 'echo hi' });
     assert.deepEqual(res, {});
     assert.equal(p.stub.count(...DECISION), 3);
-  }));
+  }, BOUND));
 
   test('network error while polling blocks as unreachable, not as a timeout', (t) => withPlugin(t, 'hitl_approve', async (p) => {
     p.stub.script('GET /api/hitl/get-decision', [{ destroy: true }]);
@@ -203,7 +207,7 @@ describe('pollHitlDecision — A4 fail fast on rejected polls', () => {
     const res = await p.callTool('exec', { command: 'echo hi' });
     assert.deepEqual(res, {});
     assert.equal(p.stub.count(...DECISION), 4);
-  }));
+  }, BOUND));
 });
 
 describe('pollHitlDecision — B2/K1 cancelled work items are terminal', () => {
@@ -223,7 +227,7 @@ describe('pollHitlDecision — B2/K1 cancelled work items are terminal', () => {
   test('hitl_cancelled mode blocks as cancelled, not rejected by a reviewer', (t) => withPlugin(t, 'hitl_cancelled', async (p) => {
     const res = await p.callTool('exec', { command: 'echo hi' });
     assertCancelledBlock(p, res);
-    assert.equal(p.stub.count(...DECISION), 1);
+    assert.equal(p.stub.count(...DECISION), 2);
   }));
 
   const terminalBodies = {
@@ -238,7 +242,7 @@ describe('pollHitlDecision — B2/K1 cancelled work items are terminal', () => {
       const res = await p.callTool('exec', { command: 'echo hi' });
       assertCancelledBlock(p, res);
       assert.equal(p.stub.count(...DECISION), 1);
-    }));
+    }, BOUND));
   }
 
   test('plain pending keeps polling', (t) => withPlugin(t, 'hitl_approve', async (p) => {
@@ -250,7 +254,7 @@ describe('pollHitlDecision — B2/K1 cancelled work items are terminal', () => {
     const res = await p.callTool('exec', { command: 'echo hi' });
     assert.deepEqual(res, {});
     assert.equal(p.stub.count(...DECISION), 3);
-  }));
+  }, BOUND));
 });
 
 // Every named stub mode with its expected outcome. todo = the item that makes it true.
@@ -289,7 +293,7 @@ describe('L — vocabulary: only reject/rejected reads as a reviewer rejection',
       const res = await p.callTool('exec', { command: 'echo hi' });
       assert.equal(res?.block, true);
       assert.match(res.blockReason, /rejected by a human reviewer/);
-    }));
+    }, BOUND));
   }
 
   for (const resolution of ['', 'expired', 'banana', null]) {
@@ -303,7 +307,7 @@ describe('L — vocabulary: only reject/rejected reads as a reviewer rejection',
         res.blockReason,
       );
       assert.doesNotMatch(res.blockReason, /rejected by/);
-    }));
+    }, BOUND));
   }
 });
 

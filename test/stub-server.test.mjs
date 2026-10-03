@@ -48,9 +48,23 @@ describe('stub-server', () => {
     assert.equal(b.instance_id, 'inst-2');
   });
 
-  test('hitl decisions echo the workitem_id from the request', async () => {
+  test('hitl request is id-less; the first poll reports the work item pending (H3)', async () => {
     for (const mode of ['hitl_approve', 'hitl_reject', 'hitl_modify', 'hitl_cancelled']) {
       stub.setMode(mode);
+      const req = await (await post('/api/hitl/request', {})).json();
+      assert.deepEqual(req, { status: 'pending' }, mode);
+      const first = await (await decision()).json();
+      assert.equal(first.status, 'pending', mode);
+      assert.match(String(first.workitem_id), /^wi-\d+$/, mode);
+      const dec = await (await decision()).json();
+      assert.equal(dec.workitem_id, first.workitem_id, mode);
+      assert.equal(dec.status, 'complete', mode);
+    }
+  });
+
+  test('boundRequest: hitl decisions echo the workitem_id from the request', async () => {
+    for (const mode of ['hitl_approve', 'hitl_reject', 'hitl_modify', 'hitl_cancelled']) {
+      stub.setMode(mode, { boundRequest: true });
       const req = await (await post('/api/hitl/request', {})).json();
       assert.equal(req.status, 'pending');
       const dec = await (await decision()).json();
@@ -59,8 +73,14 @@ describe('stub-server', () => {
     }
   });
 
+  test('boundRequest does not carry over to the next setMode', async () => {
+    stub.setMode('hitl_approve', { boundRequest: true });
+    stub.setMode('hitl_approve');
+    assert.deepEqual(await (await post('/api/hitl/request', {})).json(), { status: 'pending' });
+  });
+
   test('hitl_cancelled returns the frozen K1 body', async () => {
-    stub.setMode('hitl_cancelled');
+    stub.setMode('hitl_cancelled', { boundRequest: true });
     const req = await (await post('/api/hitl/request', {})).json();
     assert.deepEqual(await (await decision()).json(), {
       status: 'complete', resolution: 'reject', method: 'cancelled', workitem_status: 'Cancelled',
@@ -69,7 +89,7 @@ describe('stub-server', () => {
   });
 
   test('hitl_modify carries modified_action.params', async () => {
-    stub.setMode('hitl_modify');
+    stub.setMode('hitl_modify', { boundRequest: true });
     await post('/api/hitl/request', {});
     const dec = await (await decision()).json();
     assert.equal(dec.resolution, 'modify');
@@ -90,6 +110,18 @@ describe('stub-server', () => {
     const res = await decision();
     assert.equal(res.status, 429);
     assert.deepEqual(await res.json(), { error: 'call_limit_reached' });
+  });
+
+  test('respond() answers from the request (caller-scoped); undefined falls through', async () => {
+    stub.setMode('hitl_approve');
+    stub.script('GET /api/hitl/get-decision', [{ status: 200, body: { status: 'pending', from: 'script' } }]);
+    stub.respond('GET /api/hitl/get-decision', (req) => (req.query.caller_id === 'inst-1'
+      ? { status: 200, body: { status: 'pending', workitem_id: 'wi-mine' } }
+      : undefined));
+    assert.equal((await (await decision()).json()).workitem_id, 'wi-mine');
+    const other = await (await fetch(`${stub.url}/api/hitl/get-decision?caller_id=inst-2`)).json();
+    assert.equal(other.from, 'script');
+    assert.throws(() => stub.respond('GET /x', null), /needs a function/);
   });
 
   test('policy_error is HTTP 500; policy_error_200 is a 200 with message', async () => {
