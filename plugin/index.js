@@ -72,6 +72,26 @@ const HITL_POLL_INTERVAL_MS = positiveNumber(config?.HITL_POLL_INTERVAL_MS, 3000
 // Requested before_tool_call budget: the HITL window plus slack for the
 // request/log round-trips. An operator override in openclaw.json wins.
 const HOOK_TIMEOUT_MS = HITL_TIMEOUT_MS + 30_000;
+
+const PLUGIN_ID = 'amp-governance';
+// Per-call budget (lock wait + request + HITL poll). Starts as the HITL window;
+// register() cuts it below a shorter operator hook timeout so the plugin
+// returns its own block (and frees the instance slot) before the host does.
+let _callBudgetMs = HITL_TIMEOUT_MS;
+let _hookBudgetLimitMs = null; // operator before_tool_call timeout, when it binds
+
+/**
+ * Operator override for before_tool_call from openclaw.json, with the host's
+ * precedence: plugins.entries.<id>.hooks.timeouts.before_tool_call, then
+ * hooks.timeoutMs. Missing / invalid values -> null (ignored).
+ */
+function operatorHookTimeoutMs(cfg) {
+  const valid = (v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? Math.floor(v) : null);
+  const entries = cfg?.plugins?.entries;
+  const hooks = entries && typeof entries === 'object' ? entries[PLUGIN_ID]?.hooks : null;
+  if (!hooks || typeof hooks !== 'object') return null;
+  return valid(hooks.timeouts?.before_tool_call) ?? valid(hooks.timeoutMs);
+}
 // A6/K3: send action_id on request + poll only when explicitly enabled (strict true).
 const ACTION_ID_CORRELATION = config?.ACTION_ID_CORRELATION === true;
 // Block if no work item appears for this action_id within this window (default 60 s).
@@ -794,7 +814,9 @@ async function requestAndAwaitDecision(instanceId, tool, params, { signal, actio
         notifyUser(_lastSender, `AMP became unreachable during the review for "${tool}" — the call was blocked.`);
         return { block: true, blockReason: msg };
       }
-      const msg = `Tool call "${tool}" timed out waiting for human approval — blocked.`;
+      const msg = _hookBudgetLimitMs !== null
+        ? `Tool call "${tool}" blocked — the AMP review did not complete within the ${Math.round(_hookBudgetLimitMs / 1000)}s OpenClaw hook budget (plugins.entries.${PLUGIN_ID}.hooks.timeouts.before_tool_call). Raise it (max 600000) for longer reviews.`
+        : `Tool call "${tool}" timed out waiting for human approval — blocked.`;
       await ampLog(instanceId, msg, 'ERROR');
       notifyUser(_lastSender, `No response from the reviewer — "${tool}" was blocked due to timeout.`);
       return { block: true, blockReason: msg };
@@ -971,6 +993,19 @@ export default {
     api.logger.info('AMP Governance registered. Phase 4 - eval policy enforcement active.');
     _runtime = api.runtime;
 
+    // ── HOOK BUDGET: fit inside a shorter operator hook timeout (A3) ─────────
+    const override = operatorHookTimeoutMs(api.config);
+    if (override !== null) {
+      const margin = Math.min(5000, 0.25 * override);
+      _callBudgetMs = Math.min(HITL_TIMEOUT_MS, override - margin);
+      if (_callBudgetMs < HITL_TIMEOUT_MS) _hookBudgetLimitMs = override;
+      if (override < HOOK_TIMEOUT_MS) {
+        const msg = `AMP Governance: plugins.entries.${PLUGIN_ID}.hooks.timeouts.before_tool_call=${override}ms is shorter than HITL_TIMEOUT_MINUTES + 30 s (${HOOK_TIMEOUT_MS}ms); AMP reviews longer than ~${Math.round(_callBudgetMs / 1000)}s will be blocked. Raise it (max 600000).`;
+        api.logger?.error?.(msg);
+        console.error(`[AMP Governance] ${msg}`);
+      }
+    }
+
     // ── HOOK AUTO-DEPLOY on registration ─────────────────────────────────────
     // `api.rootDir` does not exist on this SDK's plugin api (only `api.source`,
     // the absolute path to this entry file) — derive the plugin root from that.
@@ -1013,7 +1048,7 @@ export default {
     // ── BEFORE TOOL CALL: governance check + logging ─────────────────────────
     api.on('before_tool_call', async (event, ctx) => {
       // C10: one budget per call, shared by the lock wait and the HITL poll.
-      const callDeadline = Date.now() + HITL_TIMEOUT_MS;
+      const callDeadline = Date.now() + _callBudgetMs;
       const tool = event.toolName || event.name || 'unknown-tool';
       if (SKIP_TOOLS.has(tool)) return {};
 

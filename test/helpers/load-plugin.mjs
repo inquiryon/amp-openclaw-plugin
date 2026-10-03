@@ -27,6 +27,7 @@ function makeFakeRuntime(calls) {
  * @param {object} [options.config]    overrides merged into amp_config.json
  * @param {object} [options.runtime]   replaces the fake api.runtime
  * @param {object} [options.stub]      reuse an existing stub (not closed by cleanup)
+ * @param {object} [options.apiConfig] OpenClaw config exposed as api.config (operator hook overrides)
  */
 export async function loadPlugin(options = {}) {
   const ownStub = !options.stub;
@@ -68,8 +69,10 @@ export async function loadPlugin(options = {}) {
   const handlers = {};
   const opts = {};
   const runtimeCalls = [];
+  const loggerErrors = [];
   const fakeApi = {
-    logger: { info() {}, warn() {}, error() {}, debug() {} },
+    logger: { info() {}, warn() {}, error(msg) { loggerErrors.push(String(msg)); }, debug() {} },
+    config: options.apiConfig,
     runtime: options.runtime ?? makeFakeRuntime(runtimeCalls),
     source: undefined, // keeps hook auto-deploy off
     on(name, fn, hookOpts) {
@@ -91,5 +94,5 @@ export async function loadPlugin(options = {}) {
     if (ownStub) await stub.close();
   };
 
-  return { handlers, opts, stub, stateDir, config, runtimeCalls, callTool, cleanup };
+  return { handlers, opts, stub, stateDir, config, runtimeCalls, loggerErrors, callTool, cleanup };
 }
