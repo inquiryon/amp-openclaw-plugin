@@ -11,7 +11,6 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { LEGACY_SESSION_FILE } from './helpers/load-plugin.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIX = path.join(HERE, 'fixtures');
@@ -52,10 +51,9 @@ const runNode = (script, args, env) => new Promise((resolve, reject) => {
 });
 
 describe('real OpenClaw host', { skip: SKIP }, () => {
-  let tmp; let stub; let env; let sessionBackup = null; let toolReport;
+  let tmp; let stub; let env; let toolReport;
 
   before(async () => {
-    if (fs.existsSync(LEGACY_SESSION_FILE)) sessionBackup = fs.readFileSync(LEGACY_SESSION_FILE);
     tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'amp-oc-real-'));
     const port = await freePort();
     const stubUrl = `http://127.0.0.1:${port}`;
@@ -85,8 +83,6 @@ describe('real OpenClaw host', { skip: SKIP }, () => {
 
   after(() => {
     stub?.kill();
-    fs.rmSync(LEGACY_SESSION_FILE, { force: true });
-    if (sessionBackup !== null) fs.writeFileSync(LEGACY_SESSION_FILE, sessionBackup);
     if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
   });
 

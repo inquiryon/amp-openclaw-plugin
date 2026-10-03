@@ -63,7 +63,6 @@ if (cfgPath && fs.existsSync(cfgPath)) {
 report.steps.pluginsConfig = config.plugins;
 
 // ── 2. real loader ───────────────────────────────────────────────────────────
-try { fs.unlinkSync('/tmp/amp-session-state.json'); } catch {}
 const loaderMod = await imp(path.join(dist, 'plugins', 'loader.js'));
 const hrg = await imp(path.join(dist, 'plugins', 'hook-runner-global.js'));
 let registry;

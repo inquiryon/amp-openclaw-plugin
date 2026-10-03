@@ -4,8 +4,9 @@
 // Usage: node drive_hook.mjs [--with-home-config] [--out result.json]
 // Env: OC_PKG, OPENCLAW_STATE_DIR, OPENCLAW_CONFIG_PATH, HOME (use a throwaway dir),
 //      STUB_LOG (defaults to <tmpdir>/amp-oc-stub_requests.jsonl, same as stub_amp.py)
-//   --with-home-config  also writes $HOME/.openclaw/hooks/amp/amp_config.json (HOME is a throwaway
-//                       dir in env-*.sh) because handler.ts hardcodes $HOME/.openclaw (ignores OPENCLAW_STATE_DIR).
+//   --with-home-config  also writes $HOME/.openclaw/hooks/amp/amp_config.json (HOME must be a throwaway
+//                       dir). handler.ts reads OPENCLAW_STATE_DIR (then CLAWDBOT_STATE_DIR) and only falls
+//                       back to $HOME/.openclaw when neither is set, so this copy matters only in that case.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';

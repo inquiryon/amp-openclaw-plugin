@@ -9,10 +9,6 @@ import { startStub } from './stub-server.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ENTRY = path.resolve(HERE, '../../plugin/index.js');
 
-// Pre-A13 location of the shared session file. The plugin no longer reads or
-// writes it (A13); kept for the real-host test, which still guards it.
-export const LEGACY_SESSION_FILE = '/tmp/amp-session-state.json';
-
 let caseCounter = 0;
 
 function makeFakeRuntime(calls) {
