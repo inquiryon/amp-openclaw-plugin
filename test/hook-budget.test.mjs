@@ -75,6 +75,21 @@ test('a policy check cut by the call budget is a budget block, not an AMP outage
   assert.doesNotMatch(res.blockReason, /did not answer|unreachable/);
 });
 
+test('an /api/agent/init cut by the call budget is a budget block, not an AMP outage', { timeout: 10_000 }, async (t) => {
+  // budget 1.5 s; init answers after 4 s -> cut by the call deadline (W2).
+  const p = await load(t, { apiConfig: override({ timeouts: { before_tool_call: 2000 } }), mode: 'allow' });
+  p.stub.script('POST /api/agent/init', [{ status: 200, body: { instance_id: 'inst-slow' }, delayMs: 4000 }]);
+  await p.handlers.message_received({ from: 'slack:channel:C1' }, { channelId: 'slack' });
+  const res = await p.callTool('exec', { command: 'echo hi' });
+  assert.equal(res.block, true);
+  assert.match(res.blockReason, /OpenClaw hook budget/);
+  assert.doesNotMatch(res.blockReason, /unreachable/);
+  await delay(200);
+  const outage = p.runtimeCalls.filter((c) => /Unreachable/.test(JSON.stringify(c)));
+  assert.deepEqual(outage, [], 'no outage notification for a budget miss');
+  assert.equal(p.stub.count('POST', '/api/hitl/request'), 0);
+});
+
 test('budget too small to start a request blocks without an AMP outage', async (t) => {
   // override 400 -> budget 300 ms: below the 500 ms floor for /api/hitl/request.
   const p = await load(t, { apiConfig: override({ timeouts: { before_tool_call: 400 } }), mode: 'allow' });

@@ -258,6 +258,9 @@ function clearSession() {
  * Ensure an AMP instance exists for this session.
  * Priority: in-memory cache → session file → create new via /api/agent/init.
  */
+/** ensureInstance() result when /api/agent/init was cut by the call's budget. */
+const INIT_BUDGET_CUT = Symbol('init-budget-cut');
+
 async function ensureInstance() {
   if (!config) return null;
 
@@ -306,6 +309,10 @@ async function ensureInstance() {
     let target = '';
     try { target = buildAmpUrl('/api/agent/init'); } catch (_) {}
     console.error(`[AMP Governance] ensureInstance failed: ${em}${ec ? ` | cause=${ec}` : ''}${target ? ` | url=${target}` : ''}`);
+    // Cut by the call's own deadline (W2): a budget miss, not an outage. The backend may
+    // still create the instance; a later duplicate is acceptable (never an allow).
+    const deadline = _callScope.getStore()?.deadline;
+    if (err?.name === 'TimeoutError' && deadline != null && deadline - Date.now() < 50) return INIT_BUDGET_CUT;
     _ampReachable = false;
     return null;
   }
@@ -1094,6 +1101,11 @@ export default {
       if (SKIP_TOOLS.has(tool)) return {};
 
       const instanceId = await ensureInstance();
+      if (instanceId === INIT_BUDGET_CUT) {
+        const msg = budgetExhaustedMessage(tool);
+        console.error(`[AMP Governance] ${msg}`);
+        return { block: true, blockReason: msg };
+      }
       if (!instanceId) {
         const reason = !config
           ? 'AMP Governance plugin is not configured (amp_config.json missing or invalid).'
