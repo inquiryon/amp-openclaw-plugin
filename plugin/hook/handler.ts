@@ -3,8 +3,29 @@ import * as path from 'path';
 
 console.log('--- [AMP Hook] Logic Loaded — Phase 5 ---');
 
-const configPath = path.join(process.env.HOME || '', '.openclaw/hooks/amp/amp_config.json');
-const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+// Same resolution as plugin/index.js (and OpenClaw's own resolveConfigDir):
+// OPENCLAW_STATE_DIR, then legacy CLAWDBOT_STATE_DIR, then ~/.openclaw.
+function resolveStateDir(): string {
+  const override = (process.env.OPENCLAW_STATE_DIR || process.env.CLAWDBOT_STATE_DIR || '').trim();
+  if (override) return override;
+  return path.join(process.env.HOME || '', '.openclaw');
+}
+
+// Loaded lazily and retried on every event until it parses, so a missing or
+// broken amp_config.json never throws at import (that used to stop the hook loading).
+let config: any = null;
+
+function loadConfig(): any {
+  if (config) return config;
+  const configPath = path.join(resolveStateDir(), 'hooks/amp/amp_config.json');
+  try {
+    config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+  } catch (err: any) {
+    console.error(`[AMP Hook] Config not loaded (${configPath}): ${err?.message || err}`);
+    config = null;
+  }
+  return config;
+}
 
 function normalizeBackendUrl(raw: unknown): string {
   let base = String(raw || '').trim();
@@ -14,14 +35,14 @@ function normalizeBackendUrl(raw: unknown): string {
 }
 
 function buildAmpUrl(p: string): string {
-  const base = normalizeBackendUrl((config as any).AMP_BACKEND_URL);
+  const base = normalizeBackendUrl(config?.AMP_BACKEND_URL);
   if (!base) throw new Error('AMP_BACKEND_URL missing');
   const suffix = p.startsWith('/') ? p : `/${p}`;
   return `${base}${suffix}`;
 }
 
 function getAmpApiKey(): string {
-  let key = String((config as any).AMP_API_KEY || '').trim();
+  let key = String(config?.AMP_API_KEY || '').trim();
   if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
     key = key.slice(1, -1).trim();
   }
@@ -29,7 +50,13 @@ function getAmpApiKey(): string {
   return key;
 }
 
-const SESSION_FILE = '/tmp/amp-session-state.json';
+// Hook-owned session record. index.js keeps its own plugin-session.json next to
+// it; each side only finalizes records tagged with its own writer (A13, #22/#23).
+const SESSION_WRITER = 'hook';
+
+function sessionFile(): string {
+  return path.join(resolveStateDir(), 'hooks/amp/hook-session.json');
+}
 const COMMAND_THRESHOLD = 30;  // roll to new instance after this many tool calls
 
 // In-memory state (cleared on process restart)
@@ -42,6 +69,7 @@ let _startupCleanupDone = false;
 // ── HELPERS ───────────────────────────────────────────────────────────────────
 
 async function ampLog(instanceId: string, message: string, level: string = 'INFO'): Promise<void> {
+  if (!config) return;
   try {
     const apiKey = getAmpApiKey();
     await fetch(buildAmpUrl('/api/log'), {
@@ -63,6 +91,7 @@ async function ampLog(instanceId: string, message: string, level: string = 'INFO
 }
 
 async function setInstanceFinished(instanceId: string): Promise<void> {
+  if (!config) return;
   try {
     const apiKey = getAmpApiKey();
     await fetch(buildAmpUrl('/api/agent/setState'), {
@@ -78,9 +107,12 @@ async function setInstanceFinished(instanceId: string): Promise<void> {
 
 function writeSessionFile(instanceId: string, convKey: string): void {
   try {
-    fs.writeFileSync(SESSION_FILE, JSON.stringify({
+    const file = sessionFile();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
       instanceId,
       convKey,
+      writer:    SESSION_WRITER,
       timestamp: new Date().toISOString()
     }), 'utf-8');
   } catch (err) {
@@ -89,7 +121,7 @@ function writeSessionFile(instanceId: string, convKey: string): void {
 }
 
 function clearSessionFile(): void {
-  try { fs.unlinkSync(SESSION_FILE); } catch {}
+  try { fs.unlinkSync(sessionFile()); } catch {}
 }
 
 function conversationKey(event: any): string {
@@ -120,15 +152,17 @@ function buildToolMessage(event: any): string {
 // ── INSTANCE LIFECYCLE ────────────────────────────────────────────────────────
 
 /**
- * On first event after process restart, finalize any orphaned instance left
- * in the session file from the previous run, then clear the file.
+ * On first event after process restart, finalize any orphaned hook-owned
+ * instance left in hook-session.json from the previous run, then clear the file.
+ * Records not tagged writer:'hook' are never finalized, and the legacy shared
+ * /tmp/amp-session-state.json is never read.
  */
 async function startupCleanup(): Promise<void> {
   if (_startupCleanupDone) return;
   _startupCleanupDone = true;
   try {
-    const session = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8'));
-    if (session?.instanceId) {
+    const session = JSON.parse(fs.readFileSync(sessionFile(), 'utf-8'));
+    if (session?.instanceId && session.writer === SESSION_WRITER) {
       console.log(`[AMP Hook] Startup: finalizing orphaned instance ${session.instanceId}`);
       await setInstanceFinished(session.instanceId);
     }
@@ -147,6 +181,7 @@ async function finalizeInstance(convKey: string, reason: string): Promise<void> 
 }
 
 async function initInstance(convKey: string, prompt: string, metadata: object): Promise<string | null> {
+  if (!config) return null;
   try {
     const initUrl = buildAmpUrl('/api/agent/init');
     const apiKey = getAmpApiKey();
@@ -208,6 +243,8 @@ async function checkThreshold(convKey: string): Promise<string | null> {
 // ── MAIN HOOK ─────────────────────────────────────────────────────────────────
 
 export default async function ampHook(event: any) {
+  if (!loadConfig()) return;  // not configured: no network, no state
+
   const type    = event.type;
   const convKey = conversationKey(event);
 
@@ -224,7 +261,8 @@ export default async function ampHook(event: any) {
   // ── 1. INBOUND MESSAGE ─────────────────────────────────────────────────────
   // Init a new instance only if this conversation has no active instance.
   // Subsequent messages in the same conversation reuse the existing instance.
-  const isInbound = type === 'message' && !!messageId;
+  // Only user-originated messages: OpenClaw also emits message:sent for agent replies.
+  const isInbound = type === 'message' && event.action === 'received' && !!messageId;
 
   if (isInbound) {
     // Deduplicate repeated message events
@@ -253,7 +291,7 @@ export default async function ampHook(event: any) {
   }
 
   // ── 2. TOOL LOGGING + THRESHOLD CHECK ─────────────────────────────────────
-  if (type.startsWith('tool:')) {
+  if (typeof type === 'string' && type.startsWith('tool:')) {
     const instanceId = await checkThreshold(convKey);
     if (instanceId) {
       try {
